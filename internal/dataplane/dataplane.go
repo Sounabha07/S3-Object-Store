@@ -13,7 +13,7 @@ package dataplane
 import (
 	"bufio"
 	"context"
-	"crypto/md5"
+	"crypto/md5" // #nosec G501 -- S3 protocol: ETag and Content-MD5 are defined as MD5; integrity relies on SHA-256
 	"errors"
 	"fmt"
 	"io"
@@ -64,7 +64,7 @@ type WriteResult struct {
 // garbage collection; nothing references them.
 func (p *Plane) Write(ctx context.Context, r io.Reader, maxSize int64) (WriteResult, error) {
 	var res WriteResult
-	h := md5.New()
+	h := md5.New() // #nosec G401 -- computes the S3 ETag (MD5 by spec), not used for security
 	src := r
 	if maxSize >= 0 {
 		src = io.LimitReader(r, maxSize+1)

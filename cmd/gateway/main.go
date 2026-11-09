@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -28,7 +29,7 @@ func main() {
 		Name:        "gateway",
 		DefaultAddr: ":9000",
 		Setup: func(ctx context.Context, log *slog.Logger) (httpserv.Setup, error) {
-			if err := os.MkdirAll(*dataDir, 0o755); err != nil {
+			if err := os.MkdirAll(*dataDir, 0o750); err != nil {
 				return httpserv.Setup{}, fmt.Errorf("create data dir: %w", err)
 			}
 			store, err := disk.Open(filepath.Join(*dataDir, "shards"))
@@ -37,6 +38,7 @@ func main() {
 			}
 			meta, err := boltstore.Open(filepath.Join(*dataDir, "meta.db"))
 			if err != nil {
+				_ = store.Close()
 				return httpserv.Setup{}, err
 			}
 			srv := s3api.New(s3api.Config{
@@ -45,7 +47,11 @@ func main() {
 				Log:  log,
 			})
 			log.Info("starting", "mode", "single-node", "data", *dataDir, "chunk_size", *chunkSize)
-			return httpserv.Setup{Handler: srv, Health: store.Health, Close: meta.Close}, nil
+			return httpserv.Setup{
+				Handler: srv,
+				Health:  store.Health,
+				Close:   func() error { return errors.Join(meta.Close(), store.Close()) },
+			}, nil
 		},
 	})
 }

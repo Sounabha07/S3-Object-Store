@@ -1,7 +1,7 @@
 package s3api
 
 import (
-	"crypto/sha1"
+	"crypto/sha1" // #nosec G505 -- verifies the client-chosen x-amz-checksum-sha1 S3 checksum; not used for security
 	"crypto/sha256"
 	"encoding/base64"
 	"hash"

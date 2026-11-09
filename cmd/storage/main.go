@@ -26,7 +26,7 @@ func main() {
 				return httpserv.Setup{}, err
 			}
 			log.Info("starting", "id", *nodeID, "data", *dataDir)
-			return httpserv.Setup{Health: d.Health}, nil
+			return httpserv.Setup{Health: d.Health, Close: d.Close}, nil
 		},
 	})
 }

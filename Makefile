@@ -1,5 +1,7 @@
 GO            ?= go
 STATICCHECK_VERSION := v0.8.2
+GOVULNCHECK_VERSION := v1.9.0
+GOSEC_VERSION       := v2.30.0
 BIN           := bin
 CMDS          := gateway metadata storage
 COVERPROFILE  := coverage.out
@@ -8,7 +10,7 @@ ifeq ($(OS),Windows_NT)
 EXE := .exe
 endif
 
-.PHONY: all build test race vet staticcheck lint cover fuzz smoke run fmt tidy up down logs clean ci
+.PHONY: all build test race vet staticcheck lint vuln sec cover fuzz smoke run fmt tidy up down logs clean ci
 
 all: lint race build
 
@@ -26,6 +28,15 @@ vet:
 
 staticcheck:
 	$(GO) run honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION) ./...
+
+# Known-vulnerability scan of dependencies and the standard library.
+vuln:
+	$(GO) run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+
+# Static security analysis. Intentional uses are annotated inline with
+# "#nosec G<rule> -- reason"; no rules are excluded globally.
+sec:
+	$(GO) run github.com/securego/gosec/v2/cmd/gosec@$(GOSEC_VERSION) -exclude-generated ./...
 
 fmt:
 	gofmt -w .
@@ -66,4 +77,4 @@ logs:
 clean:
 	rm -rf $(BIN) $(COVERPROFILE)
 
-ci: lint race
+ci: lint race vuln sec

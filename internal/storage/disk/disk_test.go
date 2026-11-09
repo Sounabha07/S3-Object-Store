@@ -7,19 +7,29 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/Sounabha07/S3-Object-Store/internal/storage"
 	"github.com/Sounabha07/S3-Object-Store/internal/storage/storagetest"
 )
 
-func newDisk(t *testing.T) *Disk {
+func openDisk(t *testing.T, dir string) *Disk {
 	t.Helper()
-	d, err := Open(t.TempDir())
+	d, err := Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = d.Close() })
 	return d
+}
+
+func newDisk(t *testing.T) *Disk { return openDisk(t, t.TempDir()) }
+
+// abs returns the absolute on-disk path of a shard, for tests that tamper
+// with files directly.
+func (d *Disk) abs(id storage.ShardID) string {
+	return filepath.Join(d.dir, filepath.FromSlash(shardPath(id)))
 }
 
 func TestConformance(t *testing.T) {
@@ -39,12 +49,12 @@ func TestCorruptedShardDetected(t *testing.T) {
 			data := storagetest.RandomBytes(t, 64<<10)
 			info := storagetest.MustPut(t, d, data)
 
-			p := d.path(info.ID)
+			p := d.abs(info.ID)
 			onDisk, err := os.ReadFile(p)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(p, mutate(onDisk), 0o644); err != nil {
+			if err := os.WriteFile(p, mutate(onDisk), 0o600); err != nil {
 				t.Fatal(err)
 			}
 
@@ -59,7 +69,7 @@ func TestCorruptedShardDetected(t *testing.T) {
 func TestVerifyingReaderStickyError(t *testing.T) {
 	d := newDisk(t)
 	info := storagetest.MustPut(t, d, []byte("hello world"))
-	if err := os.WriteFile(d.path(info.ID), []byte("hello WORLD"), 0o644); err != nil {
+	if err := os.WriteFile(d.abs(info.ID), []byte("hello WORLD"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	rc, err := d.Get(context.Background(), info.ID)
@@ -77,16 +87,16 @@ func TestVerifyingReaderStickyError(t *testing.T) {
 
 func TestOpenClearsTmp(t *testing.T) {
 	root := t.TempDir()
-	if _, err := Open(root); err != nil {
+	d, err := Open(root)
+	if err != nil {
 		t.Fatal(err)
 	}
+	_ = d.Close()
 	leftover := filepath.Join(root, "tmp", "put-crashed")
-	if err := os.WriteFile(leftover, []byte("partial"), 0o644); err != nil {
+	if err := os.WriteFile(leftover, []byte("partial"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(root); err != nil {
-		t.Fatal(err)
-	}
+	openDisk(t, root)
 	if _, err := os.Stat(leftover); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("leftover temp file survived reopen: %v", err)
 	}
@@ -100,12 +110,11 @@ func TestShardsSurviveReopen(t *testing.T) {
 	}
 	data := storagetest.RandomBytes(t, 4096)
 	info := storagetest.MustPut(t, d, data)
-
-	d2, err := Open(root)
-	if err != nil {
+	if err := d.Close(); err != nil {
 		t.Fatal(err)
 	}
-	got, err := storagetest.ReadAll(d2, info.ID)
+
+	got, err := storagetest.ReadAll(openDisk(t, root), info.ID)
 	if err != nil || !bytes.Equal(got, data) {
 		t.Fatalf("read after reopen: %v", err)
 	}
@@ -117,7 +126,7 @@ func TestFailedPutLeavesNoTempFiles(t *testing.T) {
 	if _, err := d.Put(context.Background(), failing, storage.ZeroShardID); err == nil {
 		t.Fatal("Put with failing reader succeeded")
 	}
-	entries, err := os.ReadDir(d.tmpDir)
+	entries, err := os.ReadDir(filepath.Join(d.dir, tmpDir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +138,7 @@ func TestFailedPutLeavesNoTempFiles(t *testing.T) {
 func TestWalkSkipsForeignFiles(t *testing.T) {
 	d := newDisk(t)
 	storagetest.MustPut(t, d, []byte("a"))
-	if err := os.WriteFile(filepath.Join(d.shardsDir, "README"), []byte("x"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(d.dir, shardsDir, "README"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	n := 0
@@ -138,6 +147,66 @@ func TestWalkSkipsForeignFiles(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("Walk visited %d shards, want 1", n)
+	}
+}
+
+// TestPermissions guards gosec G301/G302: shard data must not be readable or
+// writable by other local users. The previous code created directories 0755.
+func TestPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix permission bits are not meaningful on Windows")
+	}
+	dir := filepath.Join(t.TempDir(), "fresh") // created by Open itself
+	d := openDisk(t, dir)
+	info := storagetest.MustPut(t, d, []byte("secret object data"))
+
+	shard := d.abs(info.ID)
+	paths := []string{dir, filepath.Join(dir, shardsDir), filepath.Join(dir, tmpDir),
+		filepath.Dir(filepath.Dir(shard)), filepath.Dir(shard)}
+	for _, p := range paths {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := fi.Mode().Perm(); perm&0o027 != 0 {
+			t.Errorf("directory %s has mode %o; group write or any other-user access is not allowed", p, perm)
+		}
+	}
+	fi, err := os.Stat(shard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+		t.Errorf("shard file has mode %o, want no group/other access", perm)
+	}
+}
+
+// TestSymlinkOutsideRootRefused guards gosec G304: a symlink planted in the
+// data directory must not let the store read a file outside it, even when
+// the target's contents hash correctly. Plain os.Open (the previous code)
+// follows the link.
+func TestSymlinkOutsideRootRefused(t *testing.T) {
+	d := newDisk(t)
+	data := []byte("shard contents")
+	info := storagetest.MustPut(t, d, data)
+
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	shard := d.abs(info.ID)
+	if err := os.Remove(shard); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, shard); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+
+	if got, err := storagetest.ReadAll(d, info.ID); err == nil {
+		t.Fatalf("read %q through a symlink escaping the data directory", got)
+	}
+	if _, err := d.Stat(context.Background(), info.ID); err == nil {
+		t.Fatal("Stat followed a symlink escaping the data directory")
 	}
 }
 

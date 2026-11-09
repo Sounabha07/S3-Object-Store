@@ -34,6 +34,7 @@ type node struct {
 	dir    string
 	srv    *httptest.Server
 	meta   *boltstore.Store
+	store  *disk.Disk
 	client *s3.Client
 
 	mu           sync.Mutex
@@ -68,7 +69,7 @@ func start(t *testing.T, dir string, useTLS bool) *node {
 		Meta: meta,
 		Data: dataplane.New(store, "local", dataplane.DefaultChunkSize),
 	})
-	n := &node{t: t, dir: dir, meta: meta, payloadModes: map[string]int{}}
+	n := &node{t: t, dir: dir, meta: meta, store: store, payloadModes: map[string]int{}}
 	root := httpserv.Root(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPut {
 			n.mu.Lock()
@@ -95,6 +96,7 @@ func (n *node) stop() {
 	if n.srv != nil {
 		n.srv.Close()
 		_ = n.meta.Close()
+		_ = n.store.Close()
 		n.srv = nil
 	}
 }

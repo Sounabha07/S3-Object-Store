@@ -25,6 +25,7 @@ func newPlane(t *testing.T, chunkSize int64) (*Plane, *disk.Disk, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = d.Close() })
 	return New(d, "local", chunkSize), d, root
 }
 

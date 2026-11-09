@@ -22,7 +22,7 @@ func main() {
 		Name:        "metadata",
 		DefaultAddr: ":7000",
 		Setup: func(ctx context.Context, log *slog.Logger) (httpserv.Setup, error) {
-			if err := os.MkdirAll(*dataDir, 0o755); err != nil {
+			if err := os.MkdirAll(*dataDir, 0o750); err != nil {
 				return httpserv.Setup{}, fmt.Errorf("create data dir: %w", err)
 			}
 			log.Info("starting", "id", *nodeID, "data", *dataDir)

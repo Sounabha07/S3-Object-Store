@@ -126,9 +126,16 @@ make lint      # gofmt check, go vet, staticcheck
 make race      # go test -race ./...
 make cover     # coverage of internal/... across unit and integration tests
 make fuzz      # native Go fuzzing: listing pagination, aws-chunked decoder, Range parser
+make vuln      # govulncheck: known vulnerabilities in dependencies and stdlib
+make sec       # gosec static security analysis
+make ci        # lint + race + vuln + sec
 ```
 
-CI runs lint, race tests and coverage. It then starts the docker-compose
+gosec runs with no rules disabled. The three intentional findings (MD5 for
+S3 ETags and Content-MD5, SHA-1 for S3's `x-amz-checksum-sha1`) are annotated
+on the line with `#nosec` and a reason.
+
+CI runs lint, race tests, coverage, govulncheck and gosec. It then starts the docker-compose
 cluster and runs the curl and aws CLI smoke tests against it.
 
 ## Benchmarks
