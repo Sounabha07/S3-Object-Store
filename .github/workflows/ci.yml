@@ -24,7 +24,7 @@ jobs:
       - name: staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
       - name: go test -race
-        run: go test -race -count=1 -coverprofile=coverage.out ./...
+        run: go test -race -count=1 -coverpkg=./internal/... -coverprofile=coverage.out ./...
       - name: coverage summary
         run: go tool cover -func=coverage.out | tail -1
 
@@ -40,7 +40,11 @@ jobs:
         if: always()
         run: docker compose -f deploy/docker-compose.yml ps
       - name: gateway health
-        run: curl -fsS http://localhost:9000/healthz
+        run: curl -fsS http://localhost:9000/_health
+      - name: S3 smoke test against the cluster
+        run: bash scripts/smoke.sh http://localhost:9000
+      - name: aws CLI smoke test against the cluster
+        run: bash scripts/awscli-smoke.sh http://localhost:9000
       - name: logs on failure
         if: failure()
         run: docker compose -f deploy/docker-compose.yml logs

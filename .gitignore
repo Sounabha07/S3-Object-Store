@@ -1,6 +1,6 @@
 /bin/
 /data/
-coverage.out
+coverage*.out
 *.test
 *.prof
 .idea/

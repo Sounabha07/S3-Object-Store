@@ -8,7 +8,7 @@ ifeq ($(OS),Windows_NT)
 EXE := .exe
 endif
 
-.PHONY: all build test race vet staticcheck lint cover fmt tidy up down logs clean ci
+.PHONY: all build test race vet staticcheck lint cover fuzz smoke run fmt tidy up down logs clean ci
 
 all: lint race build
 
@@ -33,9 +33,23 @@ fmt:
 lint: vet staticcheck
 	@test -z "$$(gofmt -l .)" || (echo "gofmt needed:"; gofmt -l .; exit 1)
 
+# Coverage counts statements in internal/... hit by any test, so code
+# exercised by the integration suite is included.
 cover:
-	$(GO) test -race -coverprofile=$(COVERPROFILE) ./...
+	$(GO) test -race -coverpkg=./internal/... -coverprofile=$(COVERPROFILE) ./...
 	$(GO) tool cover -func=$(COVERPROFILE) | tail -1
+
+FUZZTIME ?= 30s
+fuzz:
+	$(GO) test -run=^$$ -fuzz=^FuzzListPagination$$ -fuzztime=$(FUZZTIME) ./internal/metadata/boltstore
+	$(GO) test -run=^$$ -fuzz=^FuzzChunkedReader$$ -fuzztime=$(FUZZTIME) ./internal/s3api
+	$(GO) test -run=^$$ -fuzz=^FuzzParseRange$$ -fuzztime=$(FUZZTIME) ./internal/s3api
+
+smoke:
+	bash scripts/smoke.sh
+
+run:
+	$(GO) run ./cmd/gateway -data ./data/gateway
 
 tidy:
 	$(GO) mod tidy

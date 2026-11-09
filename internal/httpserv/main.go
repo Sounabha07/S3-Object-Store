@@ -2,6 +2,7 @@ package httpserv
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -13,13 +14,27 @@ import (
 	"time"
 )
 
+// HealthPath is served by every binary. The underscore makes it an invalid
+// S3 bucket name, so it can never collide with S3 requests on the gateway.
+const HealthPath = "/_health"
+
+// Setup is what a service provides after flags are parsed.
+type Setup struct {
+	// Handler serves every path except HealthPath. It is mounted directly,
+	// not through http.ServeMux, because ServeMux redirects paths that are
+	// not "clean" (S3 keys such as "a//b" or "x/../y" are legal).
+	Handler http.Handler
+	// Health is an optional readiness check for HealthPath.
+	Health HealthFunc
+	// Close is called after the server has shut down.
+	Close func() error
+}
+
 // Service describes one binary for Main.
 type Service struct {
 	Name        string
 	DefaultAddr string
-	// Setup is called after flags are parsed. It registers routes on mux and
-	// returns an optional health check.
-	Setup func(ctx context.Context, mux *http.ServeMux, log *slog.Logger) (HealthFunc, error)
+	Setup       func(ctx context.Context, log *slog.Logger) (Setup, error)
 }
 
 // Main parses the common flags (-listen, -probe), configures structured JSON
@@ -54,18 +69,34 @@ func Main(s Service) {
 	}
 }
 
-func run(ctx context.Context, s Service, ln net.Listener, log *slog.Logger) error {
-	mux := http.NewServeMux()
-	var health HealthFunc
+// Root returns the top-level handler: HealthPath goes to the health check,
+// everything else to h (404 if h is nil).
+func Root(h http.Handler, health HealthFunc) http.Handler {
+	hh := HealthHandler(health)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == HealthPath {
+			hh.ServeHTTP(w, r)
+			return
+		}
+		if h == nil {
+			http.NotFound(w, r)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+func run(ctx context.Context, s Service, ln net.Listener, log *slog.Logger) (err error) {
+	var setup Setup
 	if s.Setup != nil {
-		h, err := s.Setup(ctx, mux, log)
-		if err != nil {
+		if setup, err = s.Setup(ctx, log); err != nil {
+			_ = ln.Close()
 			return fmt.Errorf("setup: %w", err)
 		}
-		health = h
 	}
-	mux.Handle("GET /healthz", HealthHandler(health))
-
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	if setup.Close != nil {
+		defer func() { err = errors.Join(err, setup.Close()) }()
+	}
+	srv := &http.Server{Handler: Root(setup.Handler, setup.Health), ReadHeaderTimeout: 10 * time.Second}
 	return Serve(ctx, srv, ln, 10*time.Second, log)
 }

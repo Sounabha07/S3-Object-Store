@@ -1,5 +1,5 @@
 // Package httpserv contains the HTTP server lifecycle shared by all binaries:
-// graceful shutdown, a /healthz endpoint and a probe used by container
+// graceful shutdown, a /_health endpoint and a probe used by container
 // health checks (the runtime image has no curl).
 package httpserv
 

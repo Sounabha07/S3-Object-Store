@@ -12,7 +12,7 @@ x-node: &node
 x-meta: &meta
   <<: *node
   healthcheck:
-    test: ["CMD", "/usr/local/bin/metadata", "-probe", "http://127.0.0.1:7000/healthz"]
+    test: ["CMD", "/usr/local/bin/metadata", "-probe", "http://127.0.0.1:7000/_health"]
     interval: 2s
     timeout: 3s
     retries: 15
@@ -20,7 +20,7 @@ x-meta: &meta
 x-storage: &storage
   <<: *node
   healthcheck:
-    test: ["CMD", "/usr/local/bin/storage", "-probe", "http://127.0.0.1:8000/healthz"]
+    test: ["CMD", "/usr/local/bin/storage", "-probe", "http://127.0.0.1:8000/_health"]
     interval: 2s
     timeout: 3s
     retries: 15
@@ -66,10 +66,12 @@ services:
 
   gateway:
     <<: *node
-    command: ["gateway", "-listen", ":9000"]
+    # M1: single-node mode, metadata and shards on the gateway's own volume.
+    command: ["gateway", "-listen", ":9000", "-data", "/data"]
     ports: ["9000:9000"]
+    volumes: [gateway:/data]
     healthcheck:
-      test: ["CMD", "/usr/local/bin/gateway", "-probe", "http://127.0.0.1:9000/healthz"]
+      test: ["CMD", "/usr/local/bin/gateway", "-probe", "http://127.0.0.1:9000/_health"]
       interval: 2s
       timeout: 3s
       retries: 15
@@ -85,6 +87,7 @@ services:
       storage-6: {condition: service_healthy}
 
 volumes:
+  gateway:
   meta-1:
   meta-2:
   meta-3:
