@@ -68,7 +68,13 @@ type testCluster struct {
 	ids   []placement.NodeID
 }
 
+// newTestCluster builds a replication-only cluster (see newECCluster).
 func newTestCluster(t *testing.T, n int, chunkSize int64) *testCluster {
+	t.Helper()
+	return newCluster(t, n, Config{ChunkSize: chunkSize, DisableErasure: true})
+}
+
+func newCluster(t *testing.T, n int, cfg Config) *testCluster {
 	t.Helper()
 	tc := &testCluster{nodes: map[placement.NodeID]*switchable{}}
 	stores := map[placement.NodeID]storage.Storage{}
@@ -84,7 +90,8 @@ func newTestCluster(t *testing.T, n int, chunkSize int64) *testCluster {
 		tc.nodes[id], stores[id] = s, s
 		tc.ids = append(tc.ids, id)
 	}
-	p, err := NewCluster(Config{Nodes: stores, ChunkSize: chunkSize})
+	cfg.Nodes = stores
+	p, err := NewCluster(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

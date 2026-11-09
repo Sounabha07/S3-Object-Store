@@ -4,11 +4,12 @@ A distributed, S3-compatible object store written in Go: a stateless gateway,
 a 3-node Raft metadata service, and storage nodes holding content-addressed
 shards protected by Reed-Solomon erasure coding (4+2) or 3x replication.
 
-> **Status: M3 (distributed storage).** Metadata is replicated across a
-> 3-node Raft cluster. Every chunk is stored as 3 replicas on distinct
-> storage nodes chosen by a consistent-hash ring, and a rebalancer moves
-> shards when a node is added. Erasure coding (M4), multipart, repair and GC
-> (M5), auth and metrics (M6) are not built yet.
+> **Status: M4 (erasure coding).** Metadata is replicated across a 3-node
+> Raft cluster. Objects of 1 MiB or more are stored with Reed-Solomon 4+2
+> erasure coding (each chunk as 6 shards on 6 distinct nodes); smaller ones
+> use 3x replication. Every shard is verified (SHA-256) on read, and a
+> corrupt shard is treated as missing and reconstructed. Multipart, repair
+> and GC (M5), and auth and metrics (M6) are not built yet.
 
 ## Architecture (target)
 
@@ -34,7 +35,7 @@ flowchart LR
 * **Storage nodes**: immutable shards addressed by SHA-256, fsynced before
   being acknowledged and verified on every read.
 
-### What runs today (M3)
+### What runs today (M4)
 
 ```mermaid
 flowchart LR
@@ -42,8 +43,8 @@ flowchart LR
     API -->|HTTP, follows leader| L[(meta leader)]
     L <-->|Raft| F1[(meta follower)]
     L <-->|Raft| F2[(meta follower)]
-    API --> DP[dataplane<br/>4 MiB chunks, 3 replicas]
-    DP -->|ring picks 3 of 6| SN[storage-1 .. storage-6<br/>/v1/shards API]
+    API --> DP[dataplane<br/>4 MiB chunks<br/>RS 4+2 or 3 replicas]
+    DP -->|ring picks 6 or 3 nodes| SN[storage-1 .. storage-6<br/>/v1/shards API]
 ```
 
 Without `-meta` and `-storage`, the gateway runs single-node, with metadata
@@ -119,6 +120,30 @@ and the other bucket subresources. Authentication is not checked until M6.
 * **Not built yet:** removing a node (needs repair, M5), and automatic
   rebalancing (it is triggered by an operator).
 
+## Erasure coding
+
+* **Scheme choice.** An object whose declared size is at least 1 MiB (or
+  unknown) is erasure coded RS(4,2), as long as the cluster has at least 6
+  storage nodes. Smaller objects are replicated 3x, because 6 shards of a
+  tiny object cost more than 3 copies and every read would touch 4 nodes.
+* **Layout.** Each chunk (up to 4 MiB) becomes 4 data shards of
+  `ceil(size/4)` bytes (the last zero-padded) plus 2 parity shards. Shard i
+  goes on the ring's i-th node for that chunk, so all 6 are on distinct
+  nodes. Each shard is content-addressed by its own SHA-256.
+* **Reads** fetch the 4 data shards in parallel. Only if one is missing,
+  corrupt or unreachable are the parity shards fetched and the data
+  reconstructed. Any 2 of the 6 shards can be lost; with 3 lost the read fails
+  with `503 ServiceUnavailable` (nodes unreachable) or `500 InternalError`
+  (data corrupt) before any bytes of that chunk are sent.
+* **Writes while nodes are down.** All 6 shards are written when 6
+  distinct healthy nodes exist. If not, a chunk is accepted with 5 shards
+  (it still survives one more failure), and the missing shard is recorded as
+  unplaced for repair to rebuild (M5). With fewer than 5 healthy nodes,
+  writes are refused.
+* **Overhead.** Measured in `TestStorageOverhead`, on whole chunks: 1.5
+  bytes on disk per logical byte for RS(4,2), against 3.0 for 3x
+  replication.
+
 ## Key design decisions
 
 1. **Chunks.** Objects are split into chunks of at most 4 MiB. A read loads
@@ -153,6 +178,7 @@ internal/storage                 Storage interface; disk/ backend; storagetest/ 
 internal/metadata                Metadata interface; boltstore/ state machine; raftmeta/ Raft node,
                                  HTTP API and leader-following client; metadatatest/ conformance suite
 internal/placement               consistent-hash ring with virtual nodes
+internal/erasure                 Reed-Solomon encode/reconstruct (klauspost/reedsolomon)
 internal/storagenode             storage node HTTP API and client (end-to-end verified reads)
 internal/rebalance               moves shards to match the ring after membership changes
 internal/gateway                 assembles metadata, data plane, S3 API and admin endpoints
@@ -192,7 +218,7 @@ make race      # go test -race ./...
 make cover     # coverage of internal/... across unit and integration tests
 make integration-raft     # the S3 integration suite with metadata in a 3-node Raft cluster
 make integration-cluster  # ... and with shards replicated across 6 HTTP storage nodes
-make fuzz      # native Go fuzzing: listing pagination, aws-chunked decoder, Range parser
+make fuzz      # native Go fuzzing: listing pagination, aws-chunked decoder, Range parser, erasure round trip
 make vuln      # govulncheck: known vulnerabilities in dependencies and stdlib
 make sec       # gosec static security analysis
 make ci        # lint + race + vuln + sec
