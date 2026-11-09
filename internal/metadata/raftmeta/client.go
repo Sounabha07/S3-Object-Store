@@ -337,6 +337,10 @@ func (c *Client) CompleteMultipart(context.Context, string, []metadata.Completed
 
 func (c *Client) AbortMultipart(context.Context, string) error { return metadata.ErrNotImplemented }
 
-func (c *Client) UpdateShardLocation(context.Context, metadata.ShardLocationUpdate) error {
-	return metadata.ErrNotImplemented
+// UpdateShardLocation implements metadata.Metadata. It is idempotent: a
+// retry after an unknown outcome that finds the shard already on u.To
+// reports a conflict, which the caller treats as "someone moved it".
+func (c *Client) UpdateShardLocation(ctx context.Context, u metadata.ShardLocationUpdate) error {
+	_, err := c.apply(ctx, boltstore.Command{Op: boltstore.OpUpdateShardLocation, Update: &u})
+	return err
 }

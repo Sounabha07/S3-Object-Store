@@ -21,7 +21,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"io/fs"
 	"os"
@@ -211,7 +210,7 @@ func (d *Disk) Get(ctx context.Context, id storage.ShardID) (io.ReadCloser, erro
 		}
 		return nil, fmt.Errorf("disk: open: %w", err)
 	}
-	return &verifyingReader{f: f, h: sha256.New(), want: id}, nil
+	return storage.NewVerifyingReader(f, id), nil
 }
 
 // Stat implements storage.Storage.
@@ -300,32 +299,3 @@ func (c ctxReader) Read(p []byte) (int, error) {
 	}
 	return c.r.Read(p)
 }
-
-type verifyingReader struct {
-	f    *os.File
-	h    hash.Hash
-	want storage.ShardID
-	err  error
-}
-
-func (v *verifyingReader) Read(p []byte) (int, error) {
-	if v.err != nil {
-		return 0, v.err
-	}
-	n, err := v.f.Read(p)
-	v.h.Write(p[:n])
-	if errors.Is(err, io.EOF) {
-		var got storage.ShardID
-		v.h.Sum(got[:0])
-		if got != v.want {
-			v.err = fmt.Errorf("%w: %s", storage.ErrCorrupt, v.want)
-			return n, v.err
-		}
-		v.err = io.EOF
-	} else if err != nil {
-		v.err = err
-	}
-	return n, err
-}
-
-func (v *verifyingReader) Close() error { return v.f.Close() }

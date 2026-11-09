@@ -1,7 +1,5 @@
-// Command storage runs a storage node holding immutable, content-addressed shards.
-//
-// M1: serves the health endpoint backed by the local disk store. The
-// internal shard API arrives in M3.
+// Command storage runs a storage node holding immutable, content-addressed
+// shards, served over the internal HTTP API in internal/storagenode.
 package main
 
 import (
@@ -11,6 +9,7 @@ import (
 
 	"github.com/Sounabha07/S3-Object-Store/internal/httpserv"
 	"github.com/Sounabha07/S3-Object-Store/internal/storage/disk"
+	"github.com/Sounabha07/S3-Object-Store/internal/storagenode"
 )
 
 func main() {
@@ -25,8 +24,9 @@ func main() {
 			if err != nil {
 				return httpserv.Setup{}, err
 			}
-			log.Info("starting", "id", *nodeID, "data", *dataDir)
-			return httpserv.Setup{Health: d.Health, Close: d.Close}, nil
+			log = log.With("node", *nodeID)
+			log.Info("starting", "data", *dataDir)
+			return httpserv.Setup{Handler: storagenode.Handler(d, log), Health: d.Health, Close: d.Close}, nil
 		},
 	})
 }

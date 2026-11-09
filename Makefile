@@ -10,7 +10,7 @@ ifeq ($(OS),Windows_NT)
 EXE := .exe
 endif
 
-.PHONY: all build test race integration-raft vet staticcheck lint vuln sec cover fuzz smoke run fmt tidy up down logs clean ci
+.PHONY: all build test race integration-raft integration-cluster vet staticcheck lint vuln sec cover fuzz smoke run fmt tidy up down logs clean ci
 
 all: lint race build
 
@@ -26,6 +26,10 @@ race:
 # The S3 integration suite again, with metadata in a 3-node Raft cluster.
 integration-raft:
 	S3OS_IT_META=raft $(GO) test -race -count=1 ./test/integration
+
+# ... and with shards replicated across 6 HTTP storage nodes.
+integration-cluster:
+	S3OS_IT_META=raft S3OS_IT_STORAGE=cluster $(GO) test -race -count=1 ./test/integration
 
 vet:
 	$(GO) vet ./...
@@ -81,4 +85,4 @@ logs:
 clean:
 	rm -rf $(BIN) $(COVERPROFILE)
 
-ci: lint race integration-raft vuln sec
+ci: lint race integration-raft integration-cluster vuln sec

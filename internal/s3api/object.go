@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Sounabha07/S3-Object-Store/internal/dataplane"
 	"github.com/Sounabha07/S3-Object-Store/internal/metadata"
 )
 
@@ -189,7 +190,8 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, req *request)
 	if ws := in.writers(); len(ws) > 0 {
 		src = io.TeeReader(b.r, io.MultiWriter(ws...))
 	}
-	res, err := s.data.Write(r.Context(), src, b.length)
+	versionID := newVersionID()
+	res, err := s.data.Write(r.Context(), src, b.length, dataplane.ObjectKey(req.bucket, req.key, versionID))
 	if err != nil {
 		if b.r.err != nil {
 			s.log.Info("upload body error", "request_id", req.id, "err", b.r.err)
@@ -211,7 +213,7 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, req *request)
 	obj := metadata.ObjectMeta{
 		Bucket:       req.bucket,
 		Key:          req.key,
-		VersionID:    newVersionID(),
+		VersionID:    versionID,
 		Size:         res.Size,
 		ETag:         `"` + hex.EncodeToString(res.MD5[:]) + `"`,
 		ContentType:  r.Header.Get("Content-Type"),

@@ -1,10 +1,12 @@
 // Package integration runs real aws-sdk-go-v2 clients against an in-process
 // gateway backed by the real disk store.
 //
-// Metadata backend: by default the gateway uses a local BoltDB store
-// (single-node mode). With S3OS_IT_META=raft, every test instead runs
-// against a 3-node in-process Raft metadata cluster, over real HTTP and
-// Raft TCP transports.
+// Backends are chosen by environment, so the same suite covers every mode:
+//
+//	S3OS_IT_META=raft        metadata in a 3-node in-process Raft cluster
+//	S3OS_IT_STORAGE=cluster  shards as 3 replicas on 6 HTTP storage nodes
+//
+// The defaults are a local BoltDB file and local disk (single-node mode).
 package integration
 
 import (
@@ -19,6 +21,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -26,12 +29,8 @@ import (
 	"github.com/aws/smithy-go"
 
 	"github.com/Sounabha07/S3-Object-Store/internal/dataplane"
+	"github.com/Sounabha07/S3-Object-Store/internal/gateway"
 	"github.com/Sounabha07/S3-Object-Store/internal/httpserv"
-	"github.com/Sounabha07/S3-Object-Store/internal/metadata"
-	"github.com/Sounabha07/S3-Object-Store/internal/metadata/boltstore"
-	"github.com/Sounabha07/S3-Object-Store/internal/metadata/raftmeta"
-	"github.com/Sounabha07/S3-Object-Store/internal/s3api"
-	"github.com/Sounabha07/S3-Object-Store/internal/storage/disk"
 )
 
 var ctx = context.Background()
@@ -64,40 +63,36 @@ func startNode(t *testing.T, dir string) *node { return start(t, dir, false) }
 // bodies (aws-chunked with a trailing checksum) over TLS.
 func startTLSNode(t *testing.T, dir string) *node { return start(t, dir, true) }
 
+func clusterStorage() bool { return os.Getenv("S3OS_IT_STORAGE") == "cluster" }
+
 func start(t *testing.T, dir string, useTLS bool) *node {
 	t.Helper()
-	store, err := disk.Open(filepath.Join(dir, "shards"))
+	n := &node{t: t, dir: dir, payloadModes: map[string]int{}}
+	cfg := gateway.Config{DataDir: dir, ChunkSize: dataplane.DefaultChunkSize, HealthInterval: 200 * time.Millisecond}
+	if raftMode() {
+		mc := startMetaCluster(t, filepath.Join(dir, "meta"))
+		cfg.MetaEndpoints = mc.urls
+		n.closers = append(n.closers, mc.stop)
+	}
+	if clusterStorage() {
+		sc := startStorageCluster(t, filepath.Join(dir, "storage"), 6)
+		cfg.StorageNodes = sc.urls()
+		n.closers = append(n.closers, sc.stop)
+	}
+	g, err := gateway.New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	n := &node{t: t, dir: dir, payloadModes: map[string]int{}}
-	var meta metadata.Metadata
-	if raftMode() {
-		mc := startMetaCluster(t, filepath.Join(dir, "meta"))
-		meta = raftmeta.NewClient(mc.urls, nil)
-		n.closers = append(n.closers, mc.stop)
-	} else {
-		local, err := boltstore.Open(filepath.Join(dir, "meta.db"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		meta = local
-		n.closers = append(n.closers, local.Close)
-	}
-	n.closers = append(n.closers, store.Close)
+	n.closers = append([]func() error{g.Close}, n.closers...)
 
-	handler := s3api.New(s3api.Config{
-		Meta: meta,
-		Data: dataplane.New(store, "local", dataplane.DefaultChunkSize),
-	})
 	root := httpserv.Root(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPut {
 			n.mu.Lock()
 			n.payloadModes[r.Header.Get("x-amz-content-sha256")+"|"+r.Header.Get("Content-Encoding")+"|"+r.Header.Get("x-amz-trailer")]++
 			n.mu.Unlock()
 		}
-		handler.ServeHTTP(w, r)
-	}), store.Health)
+		g.Handler.ServeHTTP(w, r)
+	}), g.Health)
 	var srv *httptest.Server
 	var client *s3.Client
 	if useTLS {

@@ -571,25 +571,12 @@ func TestCorruptShardIsNotServed(t *testing.T) {
 	data := randomBytes(t, 10_000)
 	put(t, n.client, b, "k", data)
 
-	// Flip one byte in every shard file on disk.
-	err := filepath.WalkDir(filepath.Join(n.dir, "shards", "shards"), func(p string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return err
-		}
-		raw, err := os.ReadFile(p)
-		if err != nil {
-			return err
-		}
-		raw[len(raw)/2] ^= 0x01
-		return os.WriteFile(p, raw, 0o644)
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// With a single copy there is nothing to reconstruct from (that arrives
-	// with replication in M3), so the gateway must refuse rather than serve
-	// bad bytes.
-	_, err = n.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(b), Key: aws.String("k")})
+	// Flip one byte in every shard file on disk (every replica, on every
+	// node, in whichever storage mode the suite runs).
+	corruptAllShards(t, n.dir)
+	// With every copy corrupt there is nothing to read or reconstruct from,
+	// so the gateway must refuse rather than serve bad bytes.
+	_, err := n.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(b), Key: aws.String("k")})
 	wantCode(t, err, "InternalError")
 }
 
@@ -708,4 +695,28 @@ func crc32Base64(b []byte) string {
 	h := crc32.NewIEEE()
 	h.Write(b)
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+// corruptAllShards flips one byte in every shard file under dir.
+func corruptAllShards(t *testing.T, dir string) {
+	t.Helper()
+	n := 0
+	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || len(d.Name()) != 64 || filepath.Base(filepath.Dir(filepath.Dir(filepath.Dir(p)))) != "shards" {
+			return err
+		}
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		raw[len(raw)/2] ^= 0x01
+		n++
+		return os.WriteFile(p, raw, 0o600)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n == 0 {
+		t.Fatal("found no shard files to corrupt")
+	}
 }
