@@ -25,6 +25,7 @@ var errorCodes = []struct {
 	{"NoSuchUpload", metadata.ErrNoSuchUpload},
 	{"InvalidPart", metadata.ErrInvalidPart},
 	{"InvalidPartOrder", metadata.ErrInvalidPartOrder},
+	{"EntityTooSmall", metadata.ErrEntityTooSmall},
 	{"ShardLocationConflict", metadata.ErrShardLocationConflict},
 	{"InvalidArgument", metadata.ErrInvalidArgument},
 	{"NotImplemented", metadata.ErrNotImplemented},

@@ -123,6 +123,16 @@ func TestMinimalMovementOnAdd(t *testing.T) {
 	}
 }
 
+// TestPickDuplicateExcludes: listing a node twice in exclude must not make
+// Pick think fewer nodes are eligible (found by the repair tests).
+func TestPickDuplicateExcludes(t *testing.T) {
+	r := NewRing(nodes(3)...)
+	got, err := r.Pick("k", 2, "storage-1", "storage-1", "storage-1")
+	if err != nil || len(got) != 2 || slices.Contains(got, "storage-1") {
+		t.Fatalf("Pick = %v, %v", got, err)
+	}
+}
+
 func TestNodesAndRemove(t *testing.T) {
 	r := NewRing("b", "a")
 	r.Add("c", 10)

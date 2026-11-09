@@ -13,14 +13,17 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Sounabha07/S3-Object-Store/internal/dataplane"
+	"github.com/Sounabha07/S3-Object-Store/internal/gc"
 	"github.com/Sounabha07/S3-Object-Store/internal/metadata"
 	"github.com/Sounabha07/S3-Object-Store/internal/metadata/boltstore"
 	"github.com/Sounabha07/S3-Object-Store/internal/metadata/raftmeta"
 	"github.com/Sounabha07/S3-Object-Store/internal/placement"
 	"github.com/Sounabha07/S3-Object-Store/internal/rebalance"
+	"github.com/Sounabha07/S3-Object-Store/internal/repair"
 	"github.com/Sounabha07/S3-Object-Store/internal/s3api"
 	"github.com/Sounabha07/S3-Object-Store/internal/storage"
 	"github.com/Sounabha07/S3-Object-Store/internal/storage/disk"
@@ -38,20 +41,32 @@ type Config struct {
 	// local disk in DataDir (single node, one copy).
 	StorageNodes map[placement.NodeID]string
 	ChunkSize    int64
+	MinPartSize  int64 // 0: S3's 5 MiB
 	Log          *slog.Logger
 	// HealthInterval is how often storage nodes are probed (0: 1s).
 	HealthInterval time.Duration
+
+	// RepairInterval and GCInterval run background passes; 0 disables
+	// them (they can still be triggered through /_admin/).
+	RepairInterval time.Duration
+	DeepRepair     bool // verify shard contents, not just presence
+	GCInterval     time.Duration
+	GCGrace        time.Duration // 0: gc.DefaultGrace
 }
 
 // Gateway is an assembled gateway.
 type Gateway struct {
-	Meta    metadata.Metadata
-	Plane   *dataplane.Plane
-	Handler http.Handler // S3 API plus /_admin/
-	Health  func(context.Context) error
+	Meta     metadata.Metadata
+	Plane    *dataplane.Plane
+	Repairer *repair.Repairer
+	GC       *gc.Collector
+	Handler  http.Handler // S3 API plus /_admin/
+	Health   func(context.Context) error
 
 	cancel  context.CancelFunc
 	closers []func() error
+
+	repairMu, gcMu sync.Mutex
 }
 
 // ParseNodes parses "id=url,id=url".
@@ -126,7 +141,7 @@ func New(cfg Config) (*Gateway, error) {
 		g.Health = d.Health
 	}
 
-	s3 := s3api.New(s3api.Config{Meta: g.Meta, Data: g.Plane, Log: log})
+	s3 := s3api.New(s3api.Config{Meta: g.Meta, Data: g.Plane, Log: log, MinPartSize: cfg.MinPartSize})
 	admin := g.adminHandler(log)
 	g.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// "_admin" can never be a valid bucket name, so this cannot shadow S3.
@@ -136,7 +151,50 @@ func New(cfg Config) (*Gateway, error) {
 		}
 		s3.ServeHTTP(w, r)
 	})
+	g.Repairer = &repair.Repairer{Meta: g.Meta, Plane: g.Plane, Log: log, Deep: cfg.DeepRepair}
+	g.GC = &gc.Collector{Meta: g.Meta, Plane: g.Plane, Grace: cfg.GCGrace, Log: log}
+	if cfg.RepairInterval > 0 {
+		go every(ctx, cfg.RepairInterval, func() {
+			if _, err := g.runRepair(ctx); err != nil && ctx.Err() == nil {
+				log.Warn("background repair failed", "err", err)
+			}
+		})
+	}
+	if cfg.GCInterval > 0 {
+		go every(ctx, cfg.GCInterval, func() {
+			if _, err := g.runGC(ctx); err != nil && ctx.Err() == nil {
+				log.Warn("background gc failed", "err", err)
+			}
+		})
+	}
 	return g, nil
+}
+
+// every calls fn every interval until ctx is done.
+func every(ctx context.Context, interval time.Duration, fn func()) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			fn()
+		}
+	}
+}
+
+// Passes of the same kind never overlap within one gateway.
+func (g *Gateway) runRepair(ctx context.Context) (repair.Stats, error) {
+	g.repairMu.Lock()
+	defer g.repairMu.Unlock()
+	return g.Repairer.Run(ctx)
+}
+
+func (g *Gateway) runGC(ctx context.Context) (gc.Stats, error) {
+	g.gcMu.Lock()
+	defer g.gcMu.Unlock()
+	return g.GC.Run(ctx)
 }
 
 // Close releases local resources and stops background work.
@@ -157,6 +215,24 @@ func (g *Gateway) adminHandler(log *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /_admin/rebalance", func(w http.ResponseWriter, r *http.Request) {
 		st, err := (&rebalance.Rebalancer{Meta: g.Meta, Plane: g.Plane, Log: log}).Run(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(st)
+	})
+	mux.HandleFunc("POST /_admin/repair", func(w http.ResponseWriter, r *http.Request) {
+		st, err := g.runRepair(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(st)
+	})
+	mux.HandleFunc("POST /_admin/gc", func(w http.ResponseWriter, r *http.Request) {
+		st, err := g.runGC(r.Context())
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

@@ -5,7 +5,11 @@ package metadata
 
 import (
 	"context"
+	"crypto/md5" // #nosec G501 -- S3 multipart ETag is defined over MD5
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/Sounabha07/S3-Object-Store/internal/placement"
@@ -21,6 +25,7 @@ var (
 	ErrNoSuchUpload          = errors.New("metadata: no such upload")
 	ErrInvalidPart           = errors.New("metadata: invalid part")
 	ErrInvalidPartOrder      = errors.New("metadata: invalid part order")
+	ErrEntityTooSmall        = errors.New("metadata: part smaller than the minimum part size")
 	ErrNotLeader             = errors.New("metadata: not the raft leader")
 	ErrShardLocationConflict = errors.New("metadata: shard location changed concurrently")
 	ErrInvalidArgument       = errors.New("metadata: invalid argument")
@@ -117,6 +122,23 @@ type ListResult struct {
 type UploadMeta struct {
 	ContentType string
 	UserMeta    map[string]string
+	Headers     map[string]string
+}
+
+// UploadInfo describes an in-progress multipart upload.
+type UploadInfo struct {
+	UploadID  string
+	Bucket    string
+	Key       string
+	Initiated time.Time
+	Meta      UploadMeta
+}
+
+// CompleteRequest is the input of CompleteMultipart.
+type CompleteRequest struct {
+	Parts       []CompletedPart
+	VersionID   string // version of the resulting object, chosen by the caller
+	MinPartSize int64  // every part but the last must be at least this big
 }
 
 // PartMeta is the committed state of one uploaded part.
@@ -150,6 +172,24 @@ type CompletedPart struct {
 	ETag       string
 }
 
+// MultipartETag computes S3's ETag for a multipart object: the MD5 of the
+// concatenated binary MD5s of the parts, then "-N". Part ETags are the
+// quoted hex MD5s returned by UploadPart.
+func MultipartETag(parts []CompletedPart) (string, error) {
+	h := md5.New() // #nosec G401 -- S3 defines the multipart ETag as MD5 of MD5s
+	for _, p := range parts {
+		sum, err := hex.DecodeString(strings.Trim(p.ETag, `"`))
+		if err != nil || len(sum) != md5.Size {
+			return "", fmt.Errorf("%w: part %d ETag %q", ErrInvalidPart, p.PartNumber, p.ETag)
+		}
+		h.Write(sum)
+	}
+	return fmt.Sprintf(`"%x-%d"`, h.Sum(nil), len(parts)), nil
+}
+
+// MaxPartNumber is the highest part number S3 allows.
+const MaxPartNumber = 10000
+
 // ShardLocationUpdate moves one shard to a new node (repair/rebalance).
 // It is applied only if the shard is still recorded on From, so a stale
 // repair cannot overwrite a newer location.
@@ -180,15 +220,26 @@ type Metadata interface {
 	DeleteObject(ctx context.Context, bucket, key string) error
 	ListObjects(ctx context.Context, bucket string, opts ListOptions) (ListResult, error)
 
+	// CreateMultipart starts an upload (ErrNoSuchBucket if the bucket is gone).
 	CreateMultipart(ctx context.Context, bucket, key string, m UploadMeta) (uploadID string, err error)
+	// GetUpload returns an in-progress upload (ErrNoSuchUpload).
+	GetUpload(ctx context.Context, uploadID string) (UploadInfo, error)
+	// PutPart records a part, replacing any earlier part with its number.
 	PutPart(ctx context.Context, uploadID string, p PartMeta) error
 	ListParts(ctx context.Context, uploadID string, opts ListPartsOptions) (ListPartsResult, error)
-	CompleteMultipart(ctx context.Context, uploadID string, parts []CompletedPart) (ObjectMeta, error)
+	// CompleteMultipart assembles the listed parts into an object. It
+	// fails with ErrInvalidPartOrder, ErrInvalidPart or ErrEntityTooSmall
+	// and changes nothing in that case. The returned ObjectMeta carries at
+	// least Bucket, Key, VersionID and ETag.
+	CompleteMultipart(ctx context.Context, uploadID string, req CompleteRequest) (ObjectMeta, error)
 	AbortMultipart(ctx context.Context, uploadID string) error
 
 	// UpdateShardLocation is used by repair and rebalancing.
 	UpdateShardLocation(ctx context.Context, u ShardLocationUpdate) error
-	// WalkChunks visits every chunk referenced by committed objects and
-	// in-progress multipart parts. Used by repair and GC mark phase.
+	// WalkChunks visits every chunk referenced by committed objects. Used by
+	// repair, rebalancing and the GC mark phase.
 	WalkChunks(ctx context.Context, fn func(bucket, key, versionID string, chunkIndex int, c Chunk) error) error
+	// WalkPartChunks visits every chunk of in-progress multipart parts, so
+	// GC never deletes data an upload will still commit.
+	WalkPartChunks(ctx context.Context, fn func(uploadID string, partNumber int, c Chunk) error) error
 }

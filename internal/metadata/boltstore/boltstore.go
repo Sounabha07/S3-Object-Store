@@ -43,6 +43,8 @@ var (
 	bktBuckets = []byte("buckets")
 	bktObjects = []byte("objects")
 	bktSystem  = []byte("system")
+	bktUploads = []byte("uploads") // uploadID -> JSON metadata.UploadInfo
+	bktParts   = []byte("parts")   // uploadID/ -> partNumber (4-byte BE) -> JSON metadata.PartMeta
 
 	keyAppliedIndex = []byte("applied_index")
 )
@@ -66,6 +68,11 @@ const (
 	OpDeleteObject Op = "DeleteObject"
 
 	OpUpdateShardLocation Op = "UpdateShardLocation"
+
+	OpCreateMultipart   Op = "CreateMultipart"
+	OpPutPart           Op = "PutPart"
+	OpCompleteMultipart Op = "CompleteMultipart"
+	OpAbortMultipart    Op = "AbortMultipart"
 )
 
 // Command is one deterministic mutation. It is the payload of a Raft log
@@ -78,6 +85,11 @@ type Command struct {
 	Object *metadata.ObjectMeta `json:"object,omitempty"`
 
 	Update *metadata.ShardLocationUpdate `json:"update,omitempty"`
+
+	UploadID string                    `json:"upload_id,omitempty"`
+	Upload   *metadata.UploadMeta      `json:"upload,omitempty"`
+	Part     *metadata.PartMeta        `json:"part,omitempty"`
+	Complete *metadata.CompleteRequest `json:"complete,omitempty"`
 }
 
 // Validate checks a command before it is proposed, so malformed commands
@@ -87,6 +99,22 @@ func (c Command) Validate() error {
 	case OpCreateBucket:
 		if c.Bucket == "" || !utf8.ValidString(c.Bucket) {
 			return fmt.Errorf("%w: invalid bucket name", metadata.ErrInvalidArgument)
+		}
+	case OpCreateMultipart:
+		if c.Bucket == "" || c.Key == "" || !utf8.ValidString(c.Key) || c.UploadID == "" {
+			return fmt.Errorf("%w: incomplete multipart upload", metadata.ErrInvalidArgument)
+		}
+	case OpPutPart:
+		if c.UploadID == "" || c.Part == nil || c.Part.PartNumber < 1 || c.Part.PartNumber > metadata.MaxPartNumber {
+			return fmt.Errorf("%w: invalid part", metadata.ErrInvalidArgument)
+		}
+	case OpCompleteMultipart:
+		if c.UploadID == "" || c.Complete == nil || len(c.Complete.Parts) == 0 || c.Complete.VersionID == "" {
+			return fmt.Errorf("%w: incomplete CompleteMultipart", metadata.ErrInvalidArgument)
+		}
+	case OpAbortMultipart:
+		if c.UploadID == "" {
+			return fmt.Errorf("%w: missing upload id", metadata.ErrInvalidArgument)
 		}
 	case OpUpdateShardLocation:
 		if c.Update == nil || c.Update.Bucket == "" || c.Update.Key == "" || c.Update.To == "" {
@@ -122,12 +150,23 @@ type Store struct {
 
 var _ metadata.Metadata = (*Store)(nil)
 
+// Options tune a Store.
+type Options struct {
+	// NoSync skips fsync on commit. Only for tests and bulk loading: a
+	// crash can lose recent commits.
+	NoSync bool
+}
+
 // Open opens (creating if needed) the database at path.
-func Open(path string) (*Store, error) {
+func Open(path string) (*Store, error) { return OpenWithOptions(path, Options{}) }
+
+// OpenWithOptions is Open with options.
+func OpenWithOptions(path string, o Options) (*Store, error) {
 	db, err := openDB(path)
 	if err != nil {
 		return nil, err
 	}
+	db.NoSync = o.NoSync
 	return &Store{path: path, db: db, now: func() time.Time { return time.Now().UTC() }}, nil
 }
 
@@ -137,7 +176,7 @@ func openDB(path string) (*bolt.DB, error) {
 		return nil, fmt.Errorf("boltstore: open %s: %w", path, err)
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bktBuckets, bktObjects, bktSystem} {
+		for _, b := range [][]byte{bktBuckets, bktObjects, bktSystem, bktUploads, bktParts} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -235,6 +274,11 @@ func applyTx(tx *bolt.Tx, cmd Command) (result, fatal error) {
 				return nil, err
 			}
 		}
+		// In-progress uploads into the bucket go with it; their parts'
+		// shards become garbage for GC.
+		if err := abortBucketUploads(tx, cmd.Bucket); err != nil {
+			return nil, err
+		}
 		return nil, buckets.Delete([]byte(cmd.Bucket))
 
 	case OpPutObject:
@@ -260,6 +304,14 @@ func applyTx(tx *bolt.Tx, cmd Command) (result, fatal error) {
 
 	case OpUpdateShardLocation:
 		return updateShardLocation(objects, cmd.Update)
+	case OpCreateMultipart:
+		return createMultipart(tx, cmd)
+	case OpPutPart:
+		return putPart(tx, cmd)
+	case OpCompleteMultipart:
+		return completeMultipart(tx, cmd)
+	case OpAbortMultipart:
+		return abortMultipart(tx, cmd.UploadID)
 	}
 	return fmt.Errorf("%w: unknown op %q", metadata.ErrInvalidArgument, cmd.Op), nil
 }
@@ -622,31 +674,6 @@ func decodeToken(s string) (token, error) {
 		return token{}, fmt.Errorf("%w: continuation token", metadata.ErrInvalidArgument)
 	}
 	return token{isPrefix: kind == "p", value: value}, nil
-}
-
-// CreateMultipart is not implemented until M5.
-func (s *Store) CreateMultipart(context.Context, string, string, metadata.UploadMeta) (string, error) {
-	return "", metadata.ErrNotImplemented
-}
-
-// PutPart is not implemented until M5.
-func (s *Store) PutPart(context.Context, string, metadata.PartMeta) error {
-	return metadata.ErrNotImplemented
-}
-
-// ListParts is not implemented until M5.
-func (s *Store) ListParts(context.Context, string, metadata.ListPartsOptions) (metadata.ListPartsResult, error) {
-	return metadata.ListPartsResult{}, metadata.ErrNotImplemented
-}
-
-// CompleteMultipart is not implemented until M5.
-func (s *Store) CompleteMultipart(context.Context, string, []metadata.CompletedPart) (metadata.ObjectMeta, error) {
-	return metadata.ObjectMeta{}, metadata.ErrNotImplemented
-}
-
-// AbortMultipart is not implemented until M5.
-func (s *Store) AbortMultipart(context.Context, string) error {
-	return metadata.ErrNotImplemented
 }
 
 // UpdateShardLocation implements metadata.Metadata (see updateShardLocation).

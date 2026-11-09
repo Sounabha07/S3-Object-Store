@@ -64,6 +64,19 @@ func (id *ShardID) UnmarshalText(b []byte) error {
 	return nil
 }
 
+// ErrModified is returned by DeleteIfOlder when the shard was written or
+// touched at or after the cutoff.
+var ErrModified = errors.New("storage: shard modified since cutoff")
+
+// ConditionalDeleter is implemented by stores that can delete a shard only
+// if it is older than a cutoff, atomically with respect to Put. Garbage
+// collection relies on it: a Put that reuses an existing (deduplicated)
+// shard refreshes its modification time, so a shard that an in-flight
+// upload just reused is never deleted.
+type ConditionalDeleter interface {
+	DeleteIfOlder(ctx context.Context, id ShardID, cutoff time.Time) error
+}
+
 // ShardInfo describes a stored shard.
 type ShardInfo struct {
 	ID      ShardID

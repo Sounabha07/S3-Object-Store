@@ -73,6 +73,8 @@ func statusErr(resp *http.Response) error {
 		return storage.ErrNotFound
 	case codeCorrupt:
 		return fmt.Errorf("%w: %s", storage.ErrCorrupt, msg)
+	case codeModified:
+		return storage.ErrModified
 	}
 	if resp.StatusCode == http.StatusNotFound {
 		return storage.ErrNotFound
@@ -155,6 +157,23 @@ func (c *Client) Delete(ctx context.Context, id storage.ShardID) error {
 	}
 	return nil
 }
+
+// DeleteIfOlder implements storage.ConditionalDeleter; the node applies the
+// condition atomically with respect to its own Puts.
+func (c *Client) DeleteIfOlder(ctx context.Context, id storage.ShardID, cutoff time.Time) error {
+	path := "/v1/shards/" + id.String() + "?older-than=" + strconv.FormatInt(cutoff.UnixNano(), 10)
+	resp, err := c.do(ctx, http.MethodDelete, path, nil, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return statusErr(resp)
+	}
+	return nil
+}
+
+var _ storage.ConditionalDeleter = (*Client)(nil)
 
 // Walk implements storage.Storage.
 func (c *Client) Walk(ctx context.Context, fn func(storage.ShardInfo) error) error {

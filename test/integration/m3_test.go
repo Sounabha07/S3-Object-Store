@@ -32,12 +32,21 @@ type clusterGateway struct {
 
 func startClusterGateway(t *testing.T, storageNodes int) *clusterGateway {
 	t.Helper()
+	return startClusterGatewayCfg(t, storageNodes, gateway.Config{})
+}
+
+// startClusterGatewayCfg is startClusterGateway with extra gateway settings.
+func startClusterGatewayCfg(t *testing.T, storageNodes int, cfg gateway.Config) *clusterGateway {
+	t.Helper()
 	dir := t.TempDir()
 	sc := startStorageCluster(t, filepath.Join(dir, "storage"), storageNodes)
 	t.Cleanup(func() { _ = sc.stop() })
-	g, err := gateway.New(gateway.Config{
-		DataDir: dir, StorageNodes: sc.urls(), ChunkSize: 256 << 10, HealthInterval: 100 * time.Millisecond,
-	})
+	cfg.DataDir, cfg.StorageNodes = dir, sc.urls()
+	if cfg.ChunkSize == 0 {
+		cfg.ChunkSize = 256 << 10
+	}
+	cfg.HealthInterval = 100 * time.Millisecond
+	g, err := gateway.New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

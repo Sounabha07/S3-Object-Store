@@ -4,12 +4,12 @@ A distributed, S3-compatible object store written in Go: a stateless gateway,
 a 3-node Raft metadata service, and storage nodes holding content-addressed
 shards protected by Reed-Solomon erasure coding (4+2) or 3x replication.
 
-> **Status: M4 (erasure coding).** Metadata is replicated across a 3-node
-> Raft cluster. Objects of 1 MiB or more are stored with Reed-Solomon 4+2
-> erasure coding (each chunk as 6 shards on 6 distinct nodes); smaller ones
-> use 3x replication. Every shard is verified (SHA-256) on read, and a
-> corrupt shard is treated as missing and reconstructed. Multipart, repair
-> and GC (M5), and auth and metrics (M6) are not built yet.
+> **Status: M5 (multipart, repair, GC).** Metadata is replicated across a
+> 3-node Raft cluster. Objects of 1 MiB or more are stored with Reed-Solomon
+> 4+2 erasure coding, smaller ones with 3x replication, and every shard is
+> verified on read. Multipart upload works end to end. A background repair
+> loop rebuilds missing or corrupt shards, and GC removes unreferenced ones.
+> Auth and metrics (M6) and benchmarks (M7) are not done yet.
 
 ## Architecture (target)
 
@@ -35,7 +35,7 @@ flowchart LR
 * **Storage nodes**: immutable shards addressed by SHA-256, fsynced before
   being acknowledged and verified on every read.
 
-### What runs today (M4)
+### What runs today (M5)
 
 ```mermaid
 flowchart LR
@@ -59,10 +59,11 @@ and one copy of each shard in `-data`.
 | Listing | ListObjectsV2 with `prefix`, `delimiter`, `max-keys`, `start-after`, continuation tokens, `encoding-type=url` |
 | Integrity | `Content-MD5`; `x-amz-checksum-{crc32,crc32c,crc64nvme,sha1,sha256}` as a header or an aws-chunked trailer; `x-amz-content-sha256` when it is a real digest |
 | Uploads | Plain bodies and `aws-chunked` streaming bodies (signed or unsigned, with or without trailers) |
+| Multipart | CreateMultipartUpload, UploadPart, CompleteMultipartUpload, AbortMultipartUpload, ListParts; ETag `md5-of-md5s-N`; 5 MiB minimum part size |
 
 The API uses path-style addressing only. These return `NotImplemented`:
-multipart upload (M5), CopyObject, ListObjects v1, versioning, ACLs, tagging
-and the other bucket subresources. Authentication is not checked until M6.
+CopyObject, UploadPartCopy, ListMultipartUploads, ListObjects v1,
+versioning, ACLs, tagging and the other bucket subresources. Authentication is not checked until M6.
 
 ## Metadata replication (Raft)
 
@@ -144,6 +145,39 @@ and the other bucket subresources. Authentication is not checked until M6.
   bytes on disk per logical byte for RS(4,2), against 3.0 for 3x
   replication.
 
+## Multipart, repair and garbage collection
+
+* **Multipart.** Uploads and parts live in the Raft state machine. Each part
+  is chunked and placed like an object, under its own placement key. Complete
+  checks part order, each part's ETag and the minimum part size (5 MiB for
+  every part but the last), then builds the object's chunk list in a single
+  Raft command, so it either fully happens or not at all. The upload ID is
+  chosen by the proposer, so a retried CreateMultipartUpload or Complete can
+  recognise its own earlier success.
+* **Repair** (every `-repair-interval`, or `POST /_admin/repair`). A shard
+  needs repair if it was never placed, its node is down, the node does not
+  have it, or (with `-deep-repair`) its bytes fail SHA-256. Replicas are
+  copied from a verified good copy; erasure-coded shards are reconstructed
+  from any 4 verified shards, and the result is checked against the recorded
+  checksum. A shard lost or corrupted on a live node is rewritten on that
+  node. Otherwise it goes to a healthy node that holds no other shard of the
+  chunk, and the move is committed with a conditional metadata update. Repair
+  reports chunks it cannot fix (too few shards left) and chunks with no
+  eligible node (for example RS(4,2) on exactly 6 nodes with one down) instead
+  of failing.
+* **GC** (every `-gc-interval`, or `POST /_admin/gc`) is mark-and-sweep. It
+  marks every (node, shard) referenced by committed objects and in-progress
+  parts, then deletes unreferenced shards older than `-gc-grace` (default
+  1h). Three rules keep this safe:
+  - Data is written before the metadata that references it, so uncommitted
+    uploads are protected by the grace period.
+  - Deletes are conditional on the shard still being older than the cutoff.
+  - A write that reuses an existing (deduplicated) shard refreshes its
+    timestamp under the same per-shard lock.
+
+  `TestReusedOrphanNotDeleted` covers the race these rules close: an old
+  orphan being reused by an upload that has not committed yet.
+
 ## Key design decisions
 
 1. **Chunks.** Objects are split into chunks of at most 4 MiB. A read loads
@@ -181,6 +215,8 @@ internal/placement               consistent-hash ring with virtual nodes
 internal/erasure                 Reed-Solomon encode/reconstruct (klauspost/reedsolomon)
 internal/storagenode             storage node HTTP API and client (end-to-end verified reads)
 internal/rebalance               moves shards to match the ring after membership changes
+internal/repair                  rebuilds missing/corrupt shards (copy or Reed-Solomon reconstruct)
+internal/gc                      mark-and-sweep deletion of unreferenced shards
 internal/gateway                 assembles metadata, data plane, S3 API and admin endpoints
 internal/httpserv                shared HTTP lifecycle, health checks, probes
 test/integration                 aws-sdk-go-v2 suite against an in-process gateway
@@ -207,8 +243,8 @@ aws --endpoint-url http://localhost:9000 s3 cp ./file.txt s3://demo/file.txt
 aws --endpoint-url http://localhost:9000 s3 ls s3://demo/
 ```
 
-Any access key works until SigV4 lands in M6. Files of 8 MiB or more need
-multipart upload (M5) when sent with `aws s3 cp`.
+Any access key works until SigV4 lands in M6. `aws s3 cp` uploads files of
+8 MiB or more with multipart.
 
 ## Testing
 

@@ -26,6 +26,8 @@ import (
 	"os"
 	"path"
 	"runtime"
+	"sync"
+	"time"
 
 	"github.com/Sounabha07/S3-Object-Store/internal/storage"
 )
@@ -42,6 +44,18 @@ const (
 type Disk struct {
 	dir  string // absolute path of the root, for messages and tests
 	root *os.Root
+
+	// locks serialise, per shard, publishing or reusing a shard (Put) and
+	// conditional deletion (GC). Striped by the first byte of the ID.
+	locks [256]sync.Mutex
+}
+
+var _ storage.ConditionalDeleter = (*Disk)(nil)
+
+func (d *Disk) lock(id storage.ShardID) func() {
+	m := &d.locks[id[0]]
+	m.Lock()
+	return m.Unlock
 }
 
 var _ storage.Storage = (*Disk)(nil)
@@ -106,7 +120,9 @@ func (d *Disk) Put(ctx context.Context, r io.Reader, expected storage.ShardID) (
 	}
 
 	final := shardPath(id)
-	if info, err := d.stat(id); err == nil {
+	unlock := d.lock(id)
+	defer unlock()
+	if info, err := d.touch(id); err == nil {
 		return info, nil // already stored; content addressing makes this idempotent
 	}
 
@@ -126,7 +142,7 @@ func (d *Disk) Put(ctx context.Context, r io.Reader, expected storage.ShardID) (
 	// first, the existing file is already the correct shard.
 	if err := d.root.Link(tmpName, final); err != nil {
 		if errors.Is(err, fs.ErrExist) {
-			return d.stat(id)
+			return d.touch(id)
 		}
 		return storage.ShardInfo{}, fmt.Errorf("disk: link: %w", err)
 	}
@@ -233,6 +249,36 @@ func (d *Disk) stat(id storage.ShardID) (storage.ShardInfo, error) {
 }
 
 // Delete implements storage.Storage.
+// touch refreshes an existing shard's modification time, so GC treats a
+// reused shard as freshly written. Caller holds the shard's lock.
+func (d *Disk) touch(id storage.ShardID) (storage.ShardInfo, error) {
+	now := time.Now()
+	if err := d.root.Chtimes(shardPath(id), now, now); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return storage.ShardInfo{}, storage.ErrNotFound
+		}
+		return storage.ShardInfo{}, fmt.Errorf("disk: touch: %w", err)
+	}
+	return d.stat(id)
+}
+
+// DeleteIfOlder implements storage.ConditionalDeleter.
+func (d *Disk) DeleteIfOlder(ctx context.Context, id storage.ShardID, cutoff time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	unlock := d.lock(id)
+	defer unlock()
+	info, err := d.stat(id)
+	if err != nil {
+		return err
+	}
+	if !info.ModTime.Before(cutoff) {
+		return storage.ErrModified
+	}
+	return d.Delete(ctx, id)
+}
+
 func (d *Disk) Delete(ctx context.Context, id storage.ShardID) error {
 	if err := ctx.Err(); err != nil {
 		return err

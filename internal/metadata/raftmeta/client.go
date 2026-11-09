@@ -287,7 +287,20 @@ func (c *Client) ListObjects(ctx context.Context, bucket string, opts metadata.L
 // WalkChunks implements metadata.Metadata. It streams; a stream cut short
 // is reported as an error rather than silently ending the walk.
 func (c *Client) WalkChunks(ctx context.Context, fn func(bucket, key, versionID string, chunkIndex int, c metadata.Chunk) error) error {
-	_, err := c.call(ctx, http.MethodGet, "/v1/chunks", nil, nil, func(resp *http.Response) error {
+	return c.streamChunks(ctx, "/v1/chunks", func(r chunkRecord) error {
+		return fn(r.Bucket, r.Key, r.VersionID, r.ChunkIndex, *r.Chunk)
+	})
+}
+
+// WalkPartChunks implements metadata.Metadata.
+func (c *Client) WalkPartChunks(ctx context.Context, fn func(uploadID string, partNumber int, c metadata.Chunk) error) error {
+	return c.streamChunks(ctx, "/v1/partchunks", func(r chunkRecord) error {
+		return fn(r.UploadID, r.PartNumber, *r.Chunk)
+	})
+}
+
+func (c *Client) streamChunks(ctx context.Context, path string, fn func(chunkRecord) error) error {
+	_, err := c.call(ctx, http.MethodGet, path, nil, nil, func(resp *http.Response) error {
 		sc := bufio.NewScanner(resp.Body)
 		sc.Buffer(make([]byte, 64<<10), maxCommandBytes)
 		for sc.Scan() {
@@ -304,7 +317,7 @@ func (c *Client) WalkChunks(ctx context.Context, fn func(bucket, key, versionID 
 				}
 				return fmt.Errorf("raftmeta: chunk stream: %s", rec.Error.Message)
 			case rec.Chunk != nil:
-				if err := fn(rec.Bucket, rec.Key, rec.VersionID, rec.ChunkIndex, *rec.Chunk); err != nil {
+				if err := fn(rec); err != nil {
 					return err
 				}
 			}
@@ -317,25 +330,82 @@ func (c *Client) WalkChunks(ctx context.Context, fn func(bucket, key, versionID 
 	return err
 }
 
-// Multipart upload and shard relocation arrive in later milestones.
-
-func (c *Client) CreateMultipart(context.Context, string, string, metadata.UploadMeta) (string, error) {
-	return "", metadata.ErrNotImplemented
+// CreateMultipart implements metadata.Metadata. The upload ID is chosen
+// here, so a retry after an unknown outcome can recognise its own upload.
+func (c *Client) CreateMultipart(ctx context.Context, bucket, key string, m metadata.UploadMeta) (string, error) {
+	id := boltstore.NewUploadID()
+	uncertain, err := c.apply(ctx, boltstore.Command{Op: boltstore.OpCreateMultipart, Bucket: bucket, Key: key, UploadID: id, Time: c.now(), Upload: &m})
+	if err != nil && uncertain && errors.Is(err, metadata.ErrInvalidArgument) {
+		if up, gerr := c.GetUpload(ctx, id); gerr == nil && up.Bucket == bucket && up.Key == key {
+			return id, nil // our earlier attempt created it
+		}
+	}
+	if err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
-func (c *Client) PutPart(context.Context, string, metadata.PartMeta) error {
-	return metadata.ErrNotImplemented
+// GetUpload implements metadata.Metadata.
+func (c *Client) GetUpload(ctx context.Context, uploadID string) (metadata.UploadInfo, error) {
+	var out metadata.UploadInfo
+	_, err := c.call(ctx, http.MethodGet, "/v1/upload", url.Values{"id": {uploadID}}, nil, decodeInto(&out))
+	return out, err
 }
 
-func (c *Client) ListParts(context.Context, string, metadata.ListPartsOptions) (metadata.ListPartsResult, error) {
-	return metadata.ListPartsResult{}, metadata.ErrNotImplemented
+// PutPart implements metadata.Metadata. Recording the same part twice is
+// harmless, so retries need no special handling.
+func (c *Client) PutPart(ctx context.Context, uploadID string, p metadata.PartMeta) error {
+	_, err := c.apply(ctx, boltstore.Command{Op: boltstore.OpPutPart, UploadID: uploadID, Part: &p})
+	return err
 }
 
-func (c *Client) CompleteMultipart(context.Context, string, []metadata.CompletedPart) (metadata.ObjectMeta, error) {
-	return metadata.ObjectMeta{}, metadata.ErrNotImplemented
+// ListParts implements metadata.Metadata.
+func (c *Client) ListParts(ctx context.Context, uploadID string, opts metadata.ListPartsOptions) (metadata.ListPartsResult, error) {
+	q := url.Values{"upload": {uploadID}}
+	if opts.MaxParts > 0 {
+		q.Set("max", strconv.Itoa(opts.MaxParts))
+	}
+	if opts.PartNumberMarker > 0 {
+		q.Set("marker", strconv.Itoa(opts.PartNumberMarker))
+	}
+	var out metadata.ListPartsResult
+	_, err := c.call(ctx, http.MethodGet, "/v1/parts", q, nil, decodeInto(&out))
+	return out, err
 }
 
-func (c *Client) AbortMultipart(context.Context, string) error { return metadata.ErrNotImplemented }
+// CompleteMultipart implements metadata.Metadata. If a retry finds the
+// upload gone, it checks whether the object now has the requested version,
+// i.e. whether its own earlier attempt completed it.
+func (c *Client) CompleteMultipart(ctx context.Context, uploadID string, req metadata.CompleteRequest) (metadata.ObjectMeta, error) {
+	up, err := c.GetUpload(ctx, uploadID)
+	if err != nil {
+		return metadata.ObjectMeta{}, err
+	}
+	uncertain, err := c.apply(ctx, boltstore.Command{Op: boltstore.OpCompleteMultipart, UploadID: uploadID, Time: c.now(), Complete: &req})
+	if err != nil && uncertain && errors.Is(err, metadata.ErrNoSuchUpload) {
+		if obj, gerr := c.GetObject(ctx, up.Bucket, up.Key); gerr == nil && obj.VersionID == req.VersionID {
+			err = nil
+		}
+	}
+	if err != nil {
+		return metadata.ObjectMeta{}, err
+	}
+	etag, err := metadata.MultipartETag(req.Parts)
+	if err != nil {
+		return metadata.ObjectMeta{}, err
+	}
+	return metadata.ObjectMeta{Bucket: up.Bucket, Key: up.Key, VersionID: req.VersionID, ETag: etag}, nil
+}
+
+// AbortMultipart implements metadata.Metadata.
+func (c *Client) AbortMultipart(ctx context.Context, uploadID string) error {
+	uncertain, err := c.apply(ctx, boltstore.Command{Op: boltstore.OpAbortMultipart, UploadID: uploadID})
+	if uncertain && errors.Is(err, metadata.ErrNoSuchUpload) {
+		return nil // our earlier attempt aborted it
+	}
+	return err
+}
 
 // UpdateShardLocation implements metadata.Metadata. It is idempotent: a
 // retry after an unknown outcome that finds the shard already on u.To

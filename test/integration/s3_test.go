@@ -588,7 +588,7 @@ func TestUnsupportedOperations(t *testing.T) {
 
 	_, err := c.CopyObject(ctx, &s3.CopyObjectInput{Bucket: aws.String(b), Key: aws.String("dst"), CopySource: aws.String(b + "/src")})
 	wantCode(t, err, "NotImplemented")
-	_, err = c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: aws.String(b), Key: aws.String("mp")})
+	_, err = c.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{Bucket: aws.String(b)})
 	wantCode(t, err, "NotImplemented")
 	_, err = c.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(b)})
 	wantCode(t, err, "NotImplemented")

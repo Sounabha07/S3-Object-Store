@@ -166,47 +166,14 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, req *request)
 		s.writeError(w, r, req, apiErr)
 		return
 	}
-	b, apiErr := requestBody(r)
-	if apiErr != nil {
-		s.writeError(w, r, req, apiErr)
-		return
-	}
-	if b.length > s.maxObjectSize {
-		s.writeError(w, r, req, ErrEntityTooLarge)
-		return
-	}
-	in, apiErr := parseIntegrity(r)
-	if apiErr != nil {
-		s.writeError(w, r, req, apiErr)
-		return
-	}
 	// Fail fast on a missing bucket before accepting any data.
 	if _, err := s.meta.HeadBucket(r.Context(), req.bucket); err != nil {
 		s.fail(w, r, req, err)
 		return
 	}
-
-	var src io.Reader = b.r
-	if ws := in.writers(); len(ws) > 0 {
-		src = io.TeeReader(b.r, io.MultiWriter(ws...))
-	}
 	versionID := newVersionID()
-	res, err := s.data.Write(r.Context(), src, b.length, dataplane.ObjectKey(req.bucket, req.key, versionID))
-	if err != nil {
-		if b.r.err != nil {
-			s.log.Info("upload body error", "request_id", req.id, "err", b.r.err)
-			s.writeError(w, r, req, ErrIncompleteBody)
-			return
-		}
-		s.fail(w, r, req, err)
-		return
-	}
-	if res.Size != b.length {
-		s.writeError(w, r, req, ErrIncompleteBody)
-		return
-	}
-	if apiErr := in.verify(res.MD5[:], b.trailers()); apiErr != nil {
-		s.writeError(w, r, req, apiErr)
+	res, in, ok := s.ingest(w, r, req, dataplane.ObjectKey(req.bucket, req.key, versionID))
+	if !ok {
 		return
 	}
 
@@ -234,6 +201,49 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, req *request)
 		w.Header().Set(c.header, c.sum())
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+// ingest reads a request body (plain or aws-chunked), stores it through
+// the data plane under placementKey and verifies every digest the client
+// supplied. On failure it has already written the error response.
+func (s *Server) ingest(w http.ResponseWriter, r *http.Request, req *request, placementKey string) (dataplane.WriteResult, *integrity, bool) {
+	b, apiErr := requestBody(r)
+	if apiErr != nil {
+		s.writeError(w, r, req, apiErr)
+		return dataplane.WriteResult{}, nil, false
+	}
+	if b.length > s.maxObjectSize {
+		s.writeError(w, r, req, ErrEntityTooLarge)
+		return dataplane.WriteResult{}, nil, false
+	}
+	in, apiErr := parseIntegrity(r)
+	if apiErr != nil {
+		s.writeError(w, r, req, apiErr)
+		return dataplane.WriteResult{}, nil, false
+	}
+	var src io.Reader = b.r
+	if ws := in.writers(); len(ws) > 0 {
+		src = io.TeeReader(b.r, io.MultiWriter(ws...))
+	}
+	res, err := s.data.Write(r.Context(), src, b.length, placementKey)
+	if err != nil {
+		if b.r.err != nil {
+			s.log.Info("upload body error", "request_id", req.id, "err", b.r.err)
+			s.writeError(w, r, req, ErrIncompleteBody)
+			return res, nil, false
+		}
+		s.fail(w, r, req, err)
+		return res, nil, false
+	}
+	if res.Size != b.length {
+		s.writeError(w, r, req, ErrIncompleteBody)
+		return res, nil, false
+	}
+	if apiErr := in.verify(res.MD5[:], b.trailers()); apiErr != nil {
+		s.writeError(w, r, req, apiErr)
+		return res, nil, false
+	}
+	return res, in, true
 }
 
 func parseUserMeta(h http.Header) (map[string]string, *APIError) {

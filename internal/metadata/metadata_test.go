@@ -1,6 +1,11 @@
 package metadata
 
-import "testing"
+import (
+	"crypto/md5"
+	"errors"
+	"fmt"
+	"testing"
+)
 
 func TestSchemes(t *testing.T) {
 	cases := []struct {
@@ -21,5 +26,18 @@ func TestSchemes(t *testing.T) {
 				t.Errorf("IsReplication() = %v, want %v", got, c.replication)
 			}
 		})
+	}
+}
+
+func TestMultipartETag(t *testing.T) {
+	a, b := md5.Sum([]byte("a")), md5.Sum([]byte("b"))
+	parts := []CompletedPart{{1, fmt.Sprintf(`"%x"`, a)}, {2, fmt.Sprintf("%x", b)}}
+	want := md5.Sum(append(a[:], b[:]...))
+	got, err := MultipartETag(parts)
+	if err != nil || got != fmt.Sprintf(`"%x-2"`, want) {
+		t.Fatalf("MultipartETag = %s, %v", got, err)
+	}
+	if _, err := MultipartETag([]CompletedPart{{1, `"zz"`}}); !errors.Is(err, ErrInvalidPart) {
+		t.Fatalf("bad ETag: %v", err)
 	}
 }
