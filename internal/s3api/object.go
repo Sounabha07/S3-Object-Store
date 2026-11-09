@@ -15,6 +15,7 @@ import (
 
 	"github.com/Sounabha07/S3-Object-Store/internal/dataplane"
 	"github.com/Sounabha07/S3-Object-Store/internal/metadata"
+	"github.com/Sounabha07/S3-Object-Store/internal/sigv4"
 )
 
 // maxUserMetadata is S3's limit on the total size of x-amz-meta-* headers.
@@ -41,7 +42,7 @@ type body struct {
 }
 
 // requestBody unwraps aws-chunked encoding and determines the payload length.
-func requestBody(r *http.Request) (body, *APIError) {
+func requestBody(r *http.Request, stream *sigv4.Stream) (body, *APIError) {
 	streaming := strings.HasPrefix(r.Header.Get("x-amz-content-sha256"), "STREAMING-") ||
 		hasToken(r.Header.Values("Content-Encoding"), "aws-chunked")
 	if streaming {
@@ -50,6 +51,9 @@ func requestBody(r *http.Request) (body, *APIError) {
 			return body{}, ErrMissingContentLength
 		}
 		cr := newChunkedReader(r.Body)
+		if stream != nil {
+			cr = newSignedChunkedReader(r.Body, stream)
+		}
 		return body{r: &errTrackingReader{r: cr}, length: n, trailers: cr.Trailers}, nil
 	}
 	if r.ContentLength < 0 {
@@ -157,6 +161,7 @@ func (in *integrity) verify(md5sum []byte, trailers map[string]string) *APIError
 }
 
 func (s *Server) putObject(w http.ResponseWriter, r *http.Request, req *request) {
+	req.op = "PutObject"
 	if r.Header.Get("x-amz-copy-source") != "" {
 		s.writeError(w, r, req, ErrNotImplemented.withMessage("CopyObject is not implemented."))
 		return
@@ -207,7 +212,7 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, req *request)
 // the data plane under placementKey and verifies every digest the client
 // supplied. On failure it has already written the error response.
 func (s *Server) ingest(w http.ResponseWriter, r *http.Request, req *request, placementKey string) (dataplane.WriteResult, *integrity, bool) {
-	b, apiErr := requestBody(r)
+	b, apiErr := requestBody(r, req.stream)
 	if apiErr != nil {
 		s.writeError(w, r, req, apiErr)
 		return dataplane.WriteResult{}, nil, false
@@ -227,6 +232,11 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request, req *request, pl
 	}
 	res, err := s.data.Write(r.Context(), src, b.length, placementKey)
 	if err != nil {
+		var sigErr *sigv4.Error
+		if errors.As(b.r.err, &sigErr) {
+			s.writeError(w, r, req, &APIError{Code: sigErr.Code, Message: sigErr.Message, Status: sigErr.Status})
+			return res, nil, false
+		}
 		if b.r.err != nil {
 			s.log.Info("upload body error", "request_id", req.id, "err", b.r.err)
 			s.writeError(w, r, req, ErrIncompleteBody)
@@ -296,6 +306,10 @@ func stripToken(v, token string) string {
 }
 
 func (s *Server) getObject(w http.ResponseWriter, r *http.Request, req *request) {
+	req.op = "GetObject"
+	if r.Method == http.MethodHead {
+		req.op = "HeadObject"
+	}
 	obj, err := s.meta.GetObject(r.Context(), req.bucket, req.key)
 	if err != nil {
 		s.fail(w, r, req, err)
@@ -418,6 +432,7 @@ func etagMatches(header, etag string) bool {
 }
 
 func (s *Server) deleteObject(w http.ResponseWriter, r *http.Request, req *request) {
+	req.op = "DeleteObject"
 	if err := s.meta.DeleteObject(r.Context(), req.bucket, req.key); err != nil {
 		s.fail(w, r, req, err)
 		return

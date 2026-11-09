@@ -6,13 +6,18 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
+	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Sounabha07/S3-Object-Store/internal/dataplane"
 	"github.com/Sounabha07/S3-Object-Store/internal/metadata"
+	"github.com/Sounabha07/S3-Object-Store/internal/metrics"
+	"github.com/Sounabha07/S3-Object-Store/internal/sigv4"
 )
 
 // MaxObjectSize is the largest single PutObject (or part) S3 accepts (5 GiB).
@@ -28,6 +33,11 @@ type Config struct {
 	Log           *slog.Logger
 	MaxObjectSize int64 // 0 means MaxObjectSize
 	MinPartSize   int64 // 0 means MinPartSize (5 MiB); every part but the last must be this big
+	// Auth, if set, requires every request to carry a valid SigV4
+	// signature. Nil disables authentication (development only).
+	Auth *sigv4.Verifier
+	// Metrics, if set, receives request counts, latencies and byte counts.
+	Metrics *metrics.Gateway
 }
 
 // Server is an http.Handler serving the S3 API.
@@ -37,6 +47,8 @@ type Server struct {
 	log           *slog.Logger
 	maxObjectSize int64
 	minPartSize   int64
+	auth          *sigv4.Verifier
+	metrics       *metrics.Gateway
 	now           func() time.Time
 }
 
@@ -47,6 +59,8 @@ func New(cfg Config) *Server {
 		data:          cfg.Data,
 		log:           cfg.Log,
 		maxObjectSize: cfg.MaxObjectSize,
+		auth:          cfg.Auth,
+		metrics:       cfg.Metrics,
 		now:           func() time.Time { return time.Now().UTC() },
 	}
 	if s.maxObjectSize <= 0 {
@@ -76,31 +90,85 @@ var unsupportedSubresources = []string{
 
 // request carries per-request state through handlers.
 type request struct {
-	id     string
-	bucket string
-	key    string
+	id        string
+	bucket    string
+	key       string
+	op        string // S3 operation name, for logs and metrics
+	accessKey string
+	stream    *sigv4.Stream // signed streaming upload, if any
+	bytesIn   int64
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-	req := &request{id: newRequestID()}
+	req := &request{id: newRequestID(), op: "Unsupported"}
+	body := &countingBody{rc: r.Body}
+	r.Body = body
+	defer func() { req.bytesIn = body.n }()
 	rec.Header().Set("x-amz-request-id", req.id)
 	rec.Header().Set("x-amz-id-2", req.id)
 	rec.Header().Set("Server", "s3os")
 
+	if s.auth != nil {
+		res, err := s.auth.Verify(r)
+		if err != nil {
+			var se *sigv4.Error
+			if errors.As(err, &se) {
+				req.op = "Auth"
+				s.writeError(rec, r, req, &APIError{Code: se.Code, Message: se.Message, Status: se.Status})
+			}
+			req.bytesIn = body.n
+			s.logRequest(r, req, rec, start)
+			return
+		}
+		req.accessKey, req.stream = res.AccessKey, res.Stream
+	}
+	defer func() { req.bytesIn = body.n; s.logRequest(r, req, rec, start) }()
 	s.route(rec, r, req)
+}
 
-	s.log.LogAttrs(r.Context(), slog.LevelInfo, "request",
+// logRequest writes the structured request log line and updates metrics.
+func (s *Server) logRequest(r *http.Request, req *request, rec *statusRecorder, start time.Time) {
+	elapsed := time.Since(start)
+	level := slog.LevelInfo
+	if rec.status >= 500 {
+		level = slog.LevelWarn
+	}
+	s.log.LogAttrs(r.Context(), level, "request",
 		slog.String("request_id", req.id),
+		slog.String("op", req.op),
 		slog.String("method", r.Method),
 		slog.String("bucket", req.bucket),
 		slog.String("key", req.key),
+		slog.String("access_key", req.accessKey),
+		slog.String("remote", r.RemoteAddr),
 		slog.Int("status", rec.status),
+		slog.Int64("bytes_in", req.bytesIn),
 		slog.Int64("bytes_out", rec.bytes),
-		slog.Duration("duration", time.Since(start)),
+		slog.Float64("duration_ms", float64(elapsed.Microseconds())/1000),
 	)
+	if m := s.metrics; m != nil {
+		m.Requests.WithLabelValues(req.op, strconv.Itoa(rec.status)).Inc()
+		m.Latency.WithLabelValues(req.op).Observe(elapsed.Seconds())
+		m.BytesIn.Add(float64(req.bytesIn))
+		m.BytesOut.Add(float64(rec.bytes))
+	}
 }
+
+// countingBody counts request body bytes read by handlers.
+type countingBody struct {
+	rc io.ReadCloser
+	n  int64
+}
+
+func (c *countingBody) Read(p []byte) (int, error) {
+	n, err := c.rc.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+func (c *countingBody) Close() error { return c.rc.Close() }
 
 func (s *Server) route(w http.ResponseWriter, r *http.Request, req *request) {
 	path := strings.TrimPrefix(r.URL.Path, "/")

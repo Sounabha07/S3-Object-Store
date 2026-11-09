@@ -9,6 +9,7 @@ import (
 	"context"
 	"flag"
 	"log/slog"
+	"os"
 	"strings"
 	"time"
 
@@ -26,6 +27,8 @@ func main() {
 	deepRepair := flag.Bool("deep-repair", false, "repair verifies every shard's contents, not just presence")
 	gcInterval := flag.Duration("gc-interval", time.Hour, "background garbage collection interval (0 disables)")
 	gcGrace := flag.Duration("gc-grace", time.Hour, "minimum age of an unreferenced shard before GC deletes it")
+	// Secrets come from the environment so they do not appear in process
+	// listings: S3OS_CREDENTIALS="accesskey:secret,..." and S3OS_ADMIN_TOKEN.
 
 	httpserv.Main(httpserv.Service{
 		Name:        "gateway",
@@ -35,6 +38,13 @@ func main() {
 			if err != nil {
 				return httpserv.Setup{}, err
 			}
+			creds, err := gateway.ParseCredentials(os.Getenv("S3OS_CREDENTIALS"))
+			if err != nil {
+				return httpserv.Setup{}, err
+			}
+			if len(creds) == 0 {
+				log.Warn("S3OS_CREDENTIALS is empty: authentication is DISABLED (development mode)")
+			}
 			var meta []string
 			if *metaEndpoints != "" {
 				meta = strings.Split(*metaEndpoints, ",")
@@ -42,12 +52,13 @@ func main() {
 			g, err := gateway.New(gateway.Config{
 				DataDir: *dataDir, MetaEndpoints: meta, StorageNodes: nodes, ChunkSize: *chunkSize, Log: log,
 				RepairInterval: *repairInterval, DeepRepair: *deepRepair, GCInterval: *gcInterval, GCGrace: *gcGrace,
+				Credentials: creds, AdminToken: os.Getenv("S3OS_ADMIN_TOKEN"),
 			})
 			if err != nil {
 				return httpserv.Setup{}, err
 			}
-			log.Info("starting", "raft_metadata", len(meta) > 0, "storage_nodes", len(nodes), "replicas", g.Plane.Replicas())
-			return httpserv.Setup{Handler: g.Handler, Health: g.Health, Close: g.Close}, nil
+			log.Info("starting", "raft_metadata", len(meta) > 0, "storage_nodes", len(nodes), "replicas", g.Plane.Replicas(), "auth", len(creds) > 0)
+			return httpserv.Setup{Handler: g.Handler, Health: g.Health, Close: g.Close, Metrics: g.MetricsHandler()}, nil
 		},
 	})
 }

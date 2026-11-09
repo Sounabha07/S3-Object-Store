@@ -10,6 +10,7 @@ import (
 )
 
 func (s *Server) listBuckets(w http.ResponseWriter, r *http.Request, req *request) {
+	req.op = "ListBuckets"
 	buckets, err := s.meta.ListBuckets(r.Context())
 	if err != nil {
 		s.fail(w, r, req, err)
@@ -23,6 +24,7 @@ func (s *Server) listBuckets(w http.ResponseWriter, r *http.Request, req *reques
 }
 
 func (s *Server) createBucket(w http.ResponseWriter, r *http.Request, req *request) {
+	req.op = "CreateBucket"
 	if !validBucketName(req.bucket) {
 		s.writeError(w, r, req, ErrInvalidBucketName)
 		return
@@ -39,6 +41,7 @@ func (s *Server) createBucket(w http.ResponseWriter, r *http.Request, req *reque
 }
 
 func (s *Server) deleteBucket(w http.ResponseWriter, r *http.Request, req *request) {
+	req.op = "DeleteBucket"
 	if err := s.meta.DeleteBucket(r.Context(), req.bucket); err != nil {
 		s.fail(w, r, req, err)
 		return
@@ -47,6 +50,7 @@ func (s *Server) deleteBucket(w http.ResponseWriter, r *http.Request, req *reque
 }
 
 func (s *Server) headBucket(w http.ResponseWriter, r *http.Request, req *request) {
+	req.op = "HeadBucket"
 	if _, err := s.meta.HeadBucket(r.Context(), req.bucket); err != nil {
 		s.fail(w, r, req, err)
 		return
@@ -56,6 +60,7 @@ func (s *Server) headBucket(w http.ResponseWriter, r *http.Request, req *request
 }
 
 func (s *Server) getBucketLocation(w http.ResponseWriter, r *http.Request, req *request) {
+	req.op = "GetBucketLocation"
 	if _, err := s.meta.HeadBucket(r.Context(), req.bucket); err != nil {
 		s.fail(w, r, req, err)
 		return
@@ -65,6 +70,7 @@ func (s *Server) getBucketLocation(w http.ResponseWriter, r *http.Request, req *
 }
 
 func (s *Server) listObjectsV2(w http.ResponseWriter, r *http.Request, req *request) {
+	req.op = "ListObjectsV2"
 	q := r.URL.Query()
 	opts := metadata.ListOptions{
 		Prefix:            q.Get("prefix"),
