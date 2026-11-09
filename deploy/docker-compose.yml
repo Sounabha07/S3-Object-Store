@@ -1,0 +1,96 @@
+# Full local cluster: 3 metadata (Raft) nodes, 6 storage nodes, 1 gateway.
+# Usage: make up / make down   (or docker compose -f deploy/docker-compose.yml ...)
+name: s3os
+
+x-node: &node
+  image: s3os:dev
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  restart: unless-stopped
+
+x-meta: &meta
+  <<: *node
+  healthcheck:
+    test: ["CMD", "/usr/local/bin/metadata", "-probe", "http://127.0.0.1:7000/healthz"]
+    interval: 2s
+    timeout: 3s
+    retries: 15
+
+x-storage: &storage
+  <<: *node
+  healthcheck:
+    test: ["CMD", "/usr/local/bin/storage", "-probe", "http://127.0.0.1:8000/healthz"]
+    interval: 2s
+    timeout: 3s
+    retries: 15
+
+services:
+  meta-1:
+    <<: *meta
+    command: ["metadata", "-id", "meta-1", "-listen", ":7000", "-data", "/data"]
+    volumes: [meta-1:/data]
+  meta-2:
+    <<: *meta
+    command: ["metadata", "-id", "meta-2", "-listen", ":7000", "-data", "/data"]
+    volumes: [meta-2:/data]
+  meta-3:
+    <<: *meta
+    command: ["metadata", "-id", "meta-3", "-listen", ":7000", "-data", "/data"]
+    volumes: [meta-3:/data]
+
+  storage-1:
+    <<: *storage
+    command: ["storage", "-id", "storage-1", "-listen", ":8000", "-data", "/data"]
+    volumes: [storage-1:/data]
+  storage-2:
+    <<: *storage
+    command: ["storage", "-id", "storage-2", "-listen", ":8000", "-data", "/data"]
+    volumes: [storage-2:/data]
+  storage-3:
+    <<: *storage
+    command: ["storage", "-id", "storage-3", "-listen", ":8000", "-data", "/data"]
+    volumes: [storage-3:/data]
+  storage-4:
+    <<: *storage
+    command: ["storage", "-id", "storage-4", "-listen", ":8000", "-data", "/data"]
+    volumes: [storage-4:/data]
+  storage-5:
+    <<: *storage
+    command: ["storage", "-id", "storage-5", "-listen", ":8000", "-data", "/data"]
+    volumes: [storage-5:/data]
+  storage-6:
+    <<: *storage
+    command: ["storage", "-id", "storage-6", "-listen", ":8000", "-data", "/data"]
+    volumes: [storage-6:/data]
+
+  gateway:
+    <<: *node
+    command: ["gateway", "-listen", ":9000"]
+    ports: ["9000:9000"]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/gateway", "-probe", "http://127.0.0.1:9000/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    depends_on:
+      meta-1: {condition: service_healthy}
+      meta-2: {condition: service_healthy}
+      meta-3: {condition: service_healthy}
+      storage-1: {condition: service_healthy}
+      storage-2: {condition: service_healthy}
+      storage-3: {condition: service_healthy}
+      storage-4: {condition: service_healthy}
+      storage-5: {condition: service_healthy}
+      storage-6: {condition: service_healthy}
+
+volumes:
+  meta-1:
+  meta-2:
+  meta-3:
+  storage-1:
+  storage-2:
+  storage-3:
+  storage-4:
+  storage-5:
+  storage-6:
