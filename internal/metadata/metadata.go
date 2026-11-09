@@ -25,6 +25,10 @@ var (
 	ErrShardLocationConflict = errors.New("metadata: shard location changed concurrently")
 	ErrInvalidArgument       = errors.New("metadata: invalid argument")
 	ErrNotImplemented        = errors.New("metadata: not implemented")
+	// ErrUnavailable means the metadata service could not be reached or has
+	// no quorum. For writes, the outcome is unknown: the change may or may
+	// not have been committed.
+	ErrUnavailable = errors.New("metadata: service unavailable")
 )
 
 // Scheme is the redundancy scheme of a chunk.

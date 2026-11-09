@@ -4,11 +4,11 @@ A distributed, S3-compatible object store written in Go: a stateless gateway,
 a 3-node Raft metadata service, and storage nodes holding content-addressed
 shards protected by Reed-Solomon erasure coding (4+2) or 3x replication.
 
-> **Status: M1 (single-node store).** The gateway serves the S3 API from one
-> process, with BoltDB metadata and shards on local disk. Raft (M2),
-> distribution (M3), erasure coding (M4) and the rest are not built yet. The
-> metadata and storage services in docker-compose only answer health checks
-> for now.
+> **Status: M2 (Raft metadata).** Metadata is replicated across a 3-node Raft
+> cluster with BoltDB as the state machine. The gateway is a stateless client
+> of that cluster, and still keeps shards on its own disk. Distributed storage
+> nodes (M3), erasure coding (M4) and the rest are not built yet. The storage
+> services in docker-compose only answer health checks for now.
 
 ## Architecture (target)
 
@@ -34,17 +34,22 @@ flowchart LR
 * **Storage nodes**: immutable shards addressed by SHA-256, fsynced before
   being acknowledged and verified on every read.
 
-### What M1 runs today
+### What runs today (M2)
 
 ```mermaid
 flowchart LR
-    C[S3 client] -->|S3 REST| API[s3api]
-    API --> MD[boltstore<br/>meta.db]
+    C[S3 client] -->|S3 REST| API[gateway: s3api]
+    API -->|HTTP, follows leader| L[(meta leader)]
+    L <-->|Raft| F1[(meta follower)]
+    L <-->|Raft| F2[(meta follower)]
     API --> DP[dataplane<br/>4 MiB chunks]
-    DP --> D[disk<br/>shards/ab/cd/sha256]
+    DP --> D[gateway disk<br/>shards/ab/cd/sha256]
 ```
 
-## Supported S3 API (M1)
+Without `-meta`, the gateway falls back to single-node mode, with metadata in
+a local BoltDB file.
+
+## Supported S3 API
 
 | Area | Operations |
 |---|---|
@@ -57,6 +62,36 @@ flowchart LR
 The API uses path-style addressing only. These return `NotImplemented`:
 multipart upload (M5), CopyObject, ListObjects v1, versioning, ACLs, tagging
 and the other bucket subresources. Authentication is not checked until M6.
+
+## Metadata replication (Raft)
+
+* **State machine.** Every mutation is a `Command` (CreateBucket,
+  DeleteBucket, PutObject, DeleteObject) carrying its own timestamps, so
+  applying it is deterministic. The single-node store and the Raft state
+  machine run the same `Apply` code.
+* **Persistent state machine.** BoltDB records the last applied Raft index in
+  the same transaction as each mutation. On restart Raft does not reload the
+  snapshot (`NoSnapshotRestoreOnStart`), and replayed entries at or below the
+  stored index are skipped. If the state machine file is lost, the node
+  restores its newest snapshot and replays the log.
+* **Snapshots** are a consistent BoltDB copy (`tx.WriteTo`) taken without
+  blocking writers. A follower that falls behind the leader's retained log
+  catches up by installing one.
+* **Writes** go to the leader. Followers answer `421` with the leader's
+  address, and the client follows it. A write is acknowledged only after Raft
+  commits and applies it. Without a quorum, writes fail with
+  `ServiceUnavailable` and are never acknowledged.
+* **Reads are linearizable.** Each read waits for a Raft barrier issued after
+  it arrived, so it sees every write acknowledged before it started.
+  Concurrent reads share one barrier. The cost is a log round-trip per batch
+  of reads; a lease or ReadIndex optimisation would remove it.
+* **Unknown outcomes.** If leadership is lost after an entry was appended,
+  the outcome is unknown and the client retries. PutObject and DeleteObject
+  are idempotent. For CreateBucket and DeleteBucket, a retry that sees its own
+  earlier success reports success.
+* **Membership is static**, passed with `-peers id@raftaddr@httpurl,...`.
+  Nodes with no state bootstrap from it. Adding or removing members at
+  runtime is not supported.
 
 ## Key design decisions
 
@@ -89,7 +124,8 @@ cmd/{gateway,metadata,storage}   service entry points
 internal/s3api                   S3 REST handlers, XML, errors, aws-chunked, checksums, ranges
 internal/dataplane               object <-> chunk streaming, verified reads
 internal/storage                 Storage interface; disk/ backend; storagetest/ conformance suite
-internal/metadata                Metadata interface; boltstore/ BoltDB implementation
+internal/metadata                Metadata interface; boltstore/ state machine; raftmeta/ Raft node,
+                                 HTTP API and leader-following client; metadatatest/ conformance suite
 internal/placement               Placement interface (implementation in M3)
 internal/httpserv                shared HTTP lifecycle, health checks, probes
 test/integration                 aws-sdk-go-v2 suite against an in-process gateway
@@ -125,6 +161,7 @@ multipart upload (M5) when sent with `aws s3 cp`.
 make lint      # gofmt check, go vet, staticcheck
 make race      # go test -race ./...
 make cover     # coverage of internal/... across unit and integration tests
+make integration-raft  # the S3 integration suite with metadata in a 3-node Raft cluster
 make fuzz      # native Go fuzzing: listing pagination, aws-chunked decoder, Range parser
 make vuln      # govulncheck: known vulnerabilities in dependencies and stdlib
 make sec       # gosec static security analysis
@@ -135,7 +172,8 @@ gosec runs with no rules disabled. The three intentional findings (MD5 for
 S3 ETags and Content-MD5, SHA-1 for S3's `x-amz-checksum-sha1`) are annotated
 on the line with `#nosec` and a reason.
 
-CI runs lint, race tests, coverage, govulncheck and gosec. It then starts the docker-compose
+CI runs lint, race tests, coverage, the integration suite in both metadata
+modes, govulncheck and gosec. It then starts the docker-compose
 cluster and runs the curl and aws CLI smoke tests against it.
 
 ## Benchmarks

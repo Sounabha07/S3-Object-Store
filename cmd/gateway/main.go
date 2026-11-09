@@ -1,8 +1,9 @@
 // Command gateway is the S3-compatible HTTP front end.
 //
-// M1 runs in single-node mode: metadata in a local BoltDB file and shards on
-// local disk, both under -data. Later milestones point the gateway at the
-// Raft metadata cluster and remote storage nodes instead.
+// Metadata: with -meta set, the gateway is a stateless client of the Raft
+// metadata cluster; without it, it keeps metadata in a local BoltDB file
+// (single-node mode). Shards are still stored on the gateway's local disk
+// until distributed storage nodes arrive in M3.
 package main
 
 import (
@@ -13,17 +14,21 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/Sounabha07/S3-Object-Store/internal/dataplane"
 	"github.com/Sounabha07/S3-Object-Store/internal/httpserv"
+	"github.com/Sounabha07/S3-Object-Store/internal/metadata"
 	"github.com/Sounabha07/S3-Object-Store/internal/metadata/boltstore"
+	"github.com/Sounabha07/S3-Object-Store/internal/metadata/raftmeta"
 	"github.com/Sounabha07/S3-Object-Store/internal/s3api"
 	"github.com/Sounabha07/S3-Object-Store/internal/storage/disk"
 )
 
 func main() {
-	dataDir := flag.String("data", "./data/gateway", "directory for the single-node metadata DB and shards")
+	dataDir := flag.String("data", "./data/gateway", "directory for shards (and the metadata DB in single-node mode)")
 	chunkSize := flag.Int64("chunk-size", dataplane.DefaultChunkSize, "maximum chunk size in bytes")
+	metaEndpoints := flag.String("meta", "", "comma-separated metadata node URLs (empty: single-node local metadata)")
 
 	httpserv.Main(httpserv.Service{
 		Name:        "gateway",
@@ -36,21 +41,39 @@ func main() {
 			if err != nil {
 				return httpserv.Setup{}, err
 			}
-			meta, err := boltstore.Open(filepath.Join(*dataDir, "meta.db"))
-			if err != nil {
-				_ = store.Close()
-				return httpserv.Setup{}, err
+			closers := []func() error{store.Close}
+
+			var meta metadata.Metadata
+			mode := "single-node"
+			if *metaEndpoints != "" {
+				meta = raftmeta.NewClient(strings.Split(*metaEndpoints, ","), nil)
+				mode = "raft-metadata"
+			} else {
+				local, err := boltstore.Open(filepath.Join(*dataDir, "meta.db"))
+				if err != nil {
+					_ = store.Close()
+					return httpserv.Setup{}, err
+				}
+				meta = local
+				closers = append(closers, local.Close)
 			}
+
 			srv := s3api.New(s3api.Config{
 				Meta: meta,
 				Data: dataplane.New(store, "local", *chunkSize),
 				Log:  log,
 			})
-			log.Info("starting", "mode", "single-node", "data", *dataDir, "chunk_size", *chunkSize)
+			log.Info("starting", "metadata", mode, "data", *dataDir, "chunk_size", *chunkSize)
 			return httpserv.Setup{
 				Handler: srv,
 				Health:  store.Health,
-				Close:   func() error { return errors.Join(meta.Close(), store.Close()) },
+				Close: func() error {
+					var errs []error
+					for _, c := range closers {
+						errs = append(errs, c())
+					}
+					return errors.Join(errs...)
+				},
 			}, nil
 		},
 	})

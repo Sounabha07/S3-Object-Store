@@ -1,5 +1,10 @@
 // Package integration runs real aws-sdk-go-v2 clients against an in-process
-// gateway backed by the real disk store and BoltDB metadata.
+// gateway backed by the real disk store.
+//
+// Metadata backend: by default the gateway uses a local BoltDB store
+// (single-node mode). With S3OS_IT_META=raft, every test instead runs
+// against a 3-node in-process Raft metadata cluster, over real HTTP and
+// Raft TCP transports.
 package integration
 
 import (
@@ -10,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -21,21 +27,24 @@ import (
 
 	"github.com/Sounabha07/S3-Object-Store/internal/dataplane"
 	"github.com/Sounabha07/S3-Object-Store/internal/httpserv"
+	"github.com/Sounabha07/S3-Object-Store/internal/metadata"
 	"github.com/Sounabha07/S3-Object-Store/internal/metadata/boltstore"
+	"github.com/Sounabha07/S3-Object-Store/internal/metadata/raftmeta"
 	"github.com/Sounabha07/S3-Object-Store/internal/s3api"
 	"github.com/Sounabha07/S3-Object-Store/internal/storage/disk"
 )
 
 var ctx = context.Background()
 
-// node is one running single-node gateway.
+func raftMode() bool { return os.Getenv("S3OS_IT_META") == "raft" }
+
+// node is one running gateway plus its metadata backend.
 type node struct {
-	t      *testing.T
-	dir    string
-	srv    *httptest.Server
-	meta   *boltstore.Store
-	store  *disk.Disk
-	client *s3.Client
+	t       *testing.T
+	dir     string
+	srv     *httptest.Server
+	closers []func() error
+	client  *s3.Client
 
 	mu           sync.Mutex
 	payloadModes map[string]int // x-amz-content-sha256 values seen on PUTs
@@ -61,15 +70,26 @@ func start(t *testing.T, dir string, useTLS bool) *node {
 	if err != nil {
 		t.Fatal(err)
 	}
-	meta, err := boltstore.Open(filepath.Join(dir, "meta.db"))
-	if err != nil {
-		t.Fatal(err)
+	n := &node{t: t, dir: dir, payloadModes: map[string]int{}}
+	var meta metadata.Metadata
+	if raftMode() {
+		mc := startMetaCluster(t, filepath.Join(dir, "meta"))
+		meta = raftmeta.NewClient(mc.urls, nil)
+		n.closers = append(n.closers, mc.stop)
+	} else {
+		local, err := boltstore.Open(filepath.Join(dir, "meta.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		meta = local
+		n.closers = append(n.closers, local.Close)
 	}
+	n.closers = append(n.closers, store.Close)
+
 	handler := s3api.New(s3api.Config{
 		Meta: meta,
 		Data: dataplane.New(store, "local", dataplane.DefaultChunkSize),
 	})
-	n := &node{t: t, dir: dir, meta: meta, store: store, payloadModes: map[string]int{}}
 	root := httpserv.Root(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPut {
 			n.mu.Lock()
@@ -93,12 +113,16 @@ func start(t *testing.T, dir string, useTLS bool) *node {
 }
 
 func (n *node) stop() {
-	if n.srv != nil {
-		n.srv.Close()
-		_ = n.meta.Close()
-		_ = n.store.Close()
-		n.srv = nil
+	if n.srv == nil {
+		return
 	}
+	n.srv.Close()
+	for _, c := range n.closers {
+		if err := c(); err != nil {
+			n.t.Logf("close: %v", err)
+		}
+	}
+	n.srv = nil
 }
 
 func newClient(endpoint string, optFns ...func(*s3.Options)) *s3.Client {
