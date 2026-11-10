@@ -1,0 +1,41 @@
+{
+  "started": "2026-11-10T10:33:05.6206332Z",
+  "phases": [
+    {
+      "name": "kill one storage node (storage-2)",
+      "recovery_ms": 374.652
+    },
+    {
+      "name": "kill two storage nodes (storage-3, storage-5)",
+      "recovery_ms": 72.069
+    },
+    {
+      "name": "kill the Raft leader",
+      "recovery_ms": 6307.502,
+      "note": "killed meta-1"
+    },
+    {
+      "name": "partition a storage node (storage-4)",
+      "recovery_ms": 9733.576
+    },
+    {
+      "name": "partition the Raft leader",
+      "recovery_ms": 2917.466,
+      "note": "partitioned meta-3"
+    },
+    {
+      "name": "corrupt 40 shard files on storage-1",
+      "recovery_ms": 69.639,
+      "note": "corrupted 40 files"
+    }
+  ],
+  "objects_written_acknowledged": 2047,
+  "objects_verified": 2047,
+  "mismatches": 0,
+  "unreadable": 0,
+  "write_errors_during_faults": 115,
+  "reads_ok_during_faults": 1137,
+  "read_errors_during_faults": 2,
+  "read_mismatches_during_faults": 0,
+  "corrupt_shard_reads_detected": 24
+}
