@@ -1,0 +1,12 @@
+date_utc: 2026-11-10T11:25:09Z
+git_commit: f9b021c961c1893fe58ffbde967599efc6c72e33
+go: go version go1.27.3 windows/amd64
+cpu: 13th Gen Intel(R) Core(TM) i7-13620H (10 cores, 16 threads)
+ram_gb: 15.7
+os: Microsoft Windows 11 Home Single Language 10.0.26300
+disk: NVMe WD PC SN740 SDDQNQD-512G-1014 SSD NVMe 477GB
+disk: NVMe SSSTC CL4-8D512 SSD NVMe 477GB
+docker: 29.8.0
+docker_vm_cpus: 16
+docker_vm_mem_gb: 9.7
+docker_os: Docker Desktop / kernel 6.6.87.2-microsoft-standard-WSL2

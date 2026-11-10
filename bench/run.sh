@@ -16,6 +16,9 @@ OUT="bench/results/${STAMP:-$(date -u +%Y%m%dT%H%M%SZ)}"
 mkdir -p "$OUT"
 LG=./bin/loadgen
 go build -o "$LG" ./bench/loadgen
+# Build the cluster image from the current checkout once, so every scenario
+# measures this commit (fresh() below does not rebuild).
+$DC build >/dev/null
 
 log() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$OUT/run.log"; }
 

@@ -4,13 +4,14 @@ A distributed, S3-compatible object store written in Go: a stateless gateway,
 a 3-node Raft metadata service, and storage nodes holding content-addressed
 shards protected by Reed-Solomon erasure coding (4+2) or 3x replication.
 
-> **Status: M6 (auth and observability).** Metadata is replicated across
-> a 3-node Raft cluster. Objects of 1 MiB or more are stored with
-> Reed-Solomon 4+2, smaller ones with 3x replication, and every shard is
-> verified on read. Multipart, background repair and GC are in place.
-> Requests are authenticated with AWS Signature V4, and every service
-> exports Prometheus metrics. Chaos tests and measured benchmarks (M7) are
-> not done yet.
+> **Status: M0–M7 complete.**
+> - Metadata is replicated across a 3-node Raft cluster.
+> - Objects of 1 MiB or more are stored with Reed-Solomon 4+2, smaller
+>   ones with 3x replication; every shard is verified on read.
+> - Multipart upload, background repair and GC, SigV4 authentication and
+>   Prometheus metrics are in place.
+> - Scripted chaos runs found no lost or corrupted acknowledged writes, and
+>   every performance number is measured. See [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Architecture (target)
 
@@ -36,7 +37,7 @@ flowchart LR
 * **Storage nodes**: immutable shards addressed by SHA-256, fsynced before
   being acknowledged and verified on every read.
 
-### What runs today (M5)
+### What runs today
 
 ```mermaid
 flowchart LR
@@ -258,6 +259,11 @@ internal/repair                  rebuilds missing/corrupt shards (copy or Reed-S
 internal/gc                      mark-and-sweep deletion of unreferenced shards
 internal/sigv4                   AWS Signature V4 verification (header, presigned, streaming chunks)
 internal/metrics                 Prometheus metrics
+bench/loadgen                    S3 load generator (stdlib + own SigV4 signer), report generator
+bench/run.sh, bench/warp.sh      benchmark scenarios 1-7 and the MinIO warp cross-check
+bench/results/                   raw benchmark and chaos output
+test/chaos                       fault injection + durability check against the docker cluster
+scripts/chaos.sh, scripts/demo.sh  chaos runner; aws CLI demo with a node killed mid-upload
 internal/gateway                 assembles metadata, data plane, S3 API and admin endpoints
 internal/httpserv                shared HTTP lifecycle, health checks, probes
 test/integration                 aws-sdk-go-v2 suite against an in-process gateway
@@ -309,8 +315,28 @@ on the line with `#nosec` and a reason.
 
 CI runs lint, race tests, coverage, the integration suite in both metadata
 modes, govulncheck and gosec. It then starts the docker-compose
-cluster and runs the curl and aws CLI smoke tests against it.
+cluster and runs the curl and aws CLI smoke tests, the failover smoke test
+and the aws CLI demo against it.
 
-## Benchmarks
+## Benchmarks and chaos results
 
-Not measured yet. See `BENCHMARKS.md` once M7 is complete.
+All numbers are medians of 3 runs on one laptop (i7-13620H, 16 GB, NVMe,
+Windows 11 + Docker Desktop/WSL2), with all 10 containers sharing one CPU
+and one virtual disk. [BENCHMARKS.md](BENCHMARKS.md) has the method, raw
+outputs, exact commands and what limits these numbers. A sample:
+
+| measurement | result |
+|---|---|
+| GET 1 MiB, 8 clients | 408.4 MB/s, p99 49.15 ms |
+| PUT 1 MiB (erasure coded), 8 clients | 44.5 MB/s, p99 907.53 ms |
+| GET 1 MiB with 2 of 6 storage nodes down | 227.5 MB/s, p99 107.57 ms (healthy: 250.7 MB/s) |
+| Repair after wiping a node (537 MB of shards) | 16.32 s, 32.9 MB/s rebuilt |
+| Raft leader kill: longest write stall | 3.7 s median (one run 8.9 s) |
+| Bytes on disk per logical byte | 1.500 (RS 4+2) vs 3.000 (3x replication) |
+| Chaos: 3 runs, 6 fault types each | 5,980 acknowledged writes, 5,980 verified, 0 mismatches |
+
+```bash
+RUNS=3 bash bench/run.sh            # benchmark scenarios 1-7
+bash scripts/chaos.sh 3             # chaos + durability
+bash scripts/demo.sh                # aws CLI demo (needs the aws CLI)
+```

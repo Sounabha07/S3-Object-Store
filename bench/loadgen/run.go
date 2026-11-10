@@ -71,7 +71,7 @@ func (r randReader) Read(p []byte) (int, error) { return r.src.Read(p) }
 
 func newRand() randReader {
 	var seed [32]byte
-	binary.LittleEndian.PutUint64(seed[:], rand.Uint64())
+	binary.LittleEndian.PutUint64(seed[:], rand.Uint64()) // #nosec G404 -- seeds benchmark payload data; uniqueness, not secrecy, is what matters
 	binary.LittleEndian.PutUint64(seed[8:], uint64(time.Now().UnixNano()))
 	return randReader{rand.NewChaCha8(seed)}
 }
@@ -246,7 +246,7 @@ func runCmd(args []string) error {
 		go func(w int) {
 			defer wg.Done()
 			r := newRand()
-			pick := rand.New(rand.NewPCG(uint64(w), uint64(start.UnixNano())))
+			pick := rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())) // #nosec G404 -- picks benchmark operations and keys; not security-relevant
 			var mine []string
 			local := make([]sample, 0, 1024)
 			for i := 0; ; i++ {

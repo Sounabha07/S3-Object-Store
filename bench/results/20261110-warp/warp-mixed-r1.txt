@@ -1,0 +1,56 @@
+
+Report: DELETE. Concurrency: 8. Ran: 27s
+ * Average: 11.31 obj/s
+ * Reqs: Avg: 45.1ms, 50%: 30.9ms, 90%: 82.1ms, 99%: 314.4ms, Fastest: 8.0ms, Slowest: 660.6ms, StdDev: 52.9ms
+
+Throughput, split into 27 x 1s:
+ * Fastest: 18.94 obj/s
+ * 50% Median: 12.06 obj/s
+ * Slowest: 1.59 obj/s
+
+──────────────────────────────────
+
+Report: GET. Concurrency: 8. Ran: 27s
+ * Average: 50.39 MiB/s, 50.39 obj/s
+ * Reqs: Avg: 53.2ms, 50%: 40.7ms, 90%: 92.0ms, 99%: 300.5ms, Fastest: 9.4ms, Slowest: 597.1ms, StdDev: 46.1ms
+ * TTFB: Avg: 45ms, Best: 7ms, 25th: 22ms, Median: 33ms, 75th: 52ms, 90th: 78ms, 99th: 291ms, Worst: 574ms StdDev: 43ms
+
+Throughput, split into 27 x 1s:
+ * Fastest: 86.6MiB/s, 86.57 obj/s
+ * 50% Median: 54.6MiB/s, 54.64 obj/s
+ * Slowest: 5.0MiB/s, 5.03 obj/s
+
+──────────────────────────────────
+
+Report: PUT. Concurrency: 8. Ran: 27s
+ * Average: 16.85 MiB/s, 16.85 obj/s
+ * Reqs: Avg: 181.6ms, 50%: 158.1ms, 90%: 273.8ms, 99%: 645.4ms, Fastest: 44.6ms, Slowest: 1123.5ms, StdDev: 111.4ms
+ * TTFB: Avg: 160ms, Best: 34ms, 25th: 103ms, Median: 134ms, 75th: 188ms, 90th: 246ms, 99th: 623ms, Worst: 1.12s StdDev: 108ms
+
+Throughput, split into 27 x 1s:
+ * Fastest: 26.7MiB/s, 26.68 obj/s
+ * 50% Median: 19.2MiB/s, 19.20 obj/s
+ * Slowest: 2.4MiB/s, 2.45 obj/s
+
+──────────────────────────────────
+
+Report: STAT. Concurrency: 8. Ran: 27s
+ * Average: 33.67 obj/s
+ * Reqs: Avg: 39.3ms, 50%: 27.0ms, 90%: 68.8ms, 99%: 303.3ms, Fastest: 6.8ms, Slowest: 750.1ms, StdDev: 47.6ms
+
+Throughput, split into 27 x 1s:
+ * Fastest: 61.34 obj/s
+ * 50% Median: 37.93 obj/s
+ * Slowest: 3.44 obj/s
+
+
+──────────────────────────────────
+
+Report: Total. Concurrency: 8. Ran: 27s
+ * Average: 67.24 MiB/s, 112.22 obj/s
+
+Throughput, split into 27 x 1s:
+ * Fastest: 109.5MiB/s, 187.88 obj/s
+ * 50% Median: 77.7MiB/s, 126.35 obj/s
+ * Slowest: 7.5MiB/s, 15.07 obj/s
+
