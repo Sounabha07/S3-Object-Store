@@ -76,6 +76,10 @@ services:
               "-storage", "storage-1=http://storage-1:8000,storage-2=http://storage-2:8000,storage-3=http://storage-3:8000,storage-4=http://storage-4:8000,storage-5=http://storage-5:8000,storage-6=http://storage-6:8000"]
     ports: ["9000:9000"]
     volumes: [gateway:/data]
+    # Development credentials. Real deployments must override these.
+    environment:
+      S3OS_CREDENTIALS: "test-access-key:test-secret-key"
+      S3OS_ADMIN_TOKEN: "dev-admin-token"
     healthcheck:
       test: ["CMD", "/usr/local/bin/gateway", "-probe", "http://127.0.0.1:9000/_health"]
       interval: 2s

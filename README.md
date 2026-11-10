@@ -4,12 +4,13 @@ A distributed, S3-compatible object store written in Go: a stateless gateway,
 a 3-node Raft metadata service, and storage nodes holding content-addressed
 shards protected by Reed-Solomon erasure coding (4+2) or 3x replication.
 
-> **Status: M5 (multipart, repair, GC).** Metadata is replicated across a
-> 3-node Raft cluster. Objects of 1 MiB or more are stored with Reed-Solomon
-> 4+2 erasure coding, smaller ones with 3x replication, and every shard is
-> verified on read. Multipart upload works end to end. A background repair
-> loop rebuilds missing or corrupt shards, and GC removes unreferenced ones.
-> Auth and metrics (M6) and benchmarks (M7) are not done yet.
+> **Status: M6 (auth and observability).** Metadata is replicated across
+> a 3-node Raft cluster. Objects of 1 MiB or more are stored with
+> Reed-Solomon 4+2, smaller ones with 3x replication, and every shard is
+> verified on read. Multipart, background repair and GC are in place.
+> Requests are authenticated with AWS Signature V4, and every service
+> exports Prometheus metrics. Chaos tests and measured benchmarks (M7) are
+> not done yet.
 
 ## Architecture (target)
 
@@ -61,9 +62,12 @@ and one copy of each shard in `-data`.
 | Uploads | Plain bodies and `aws-chunked` streaming bodies (signed or unsigned, with or without trailers) |
 | Multipart | CreateMultipartUpload, UploadPart, CompleteMultipartUpload, AbortMultipartUpload, ListParts; ETag `md5-of-md5s-N`; 5 MiB minimum part size |
 
+| Auth | AWS Signature V4: `Authorization` header, presigned URLs, signed streaming chunks (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER]`) |
+
 The API uses path-style addressing only. These return `NotImplemented`:
 CopyObject, UploadPartCopy, ListMultipartUploads, ListObjects v1,
-versioning, ACLs, tagging and the other bucket subresources. Authentication is not checked until M6.
+versioning, ACLs, tagging and the other bucket subresources. There are no
+per-key permissions: any configured key can do everything.
 
 ## Metadata replication (Raft)
 
@@ -178,6 +182,41 @@ versioning, ACLs, tagging and the other bucket subresources. Authentication is n
   `TestReusedOrphanNotDeleted` covers the race these rules close: an old
   orphan being reused by an upload that has not committed yet.
 
+## Authentication and observability
+
+* **SigV4.** Credentials are static access-key/secret pairs, passed in
+  `S3OS_CREDENTIALS="key:secret,..."` (environment, so secrets never
+  appear in process listings). With credentials set, every S3 request must
+  be signed. The verifier rebuilds the canonical request and compares
+  signatures in constant time. It rejects:
+  - clock skew over 15 minutes;
+  - expired presigned URLs;
+  - an unsigned `host` header;
+  - signed streaming uploads whose chunk signature chain breaks (a
+    tampered, reordered or dropped chunk), before anything is committed.
+
+  It is checked against six request examples published in AWS's S3
+  documentation, and end to end with the aws SDK (normal requests, presigned
+  URLs) and curl's own `--aws-sigv4` implementation. With no credentials the
+  gateway logs a warning and accepts anonymous requests (development only).
+* **Admin API** (`/_admin/rebalance`, `/_admin/repair`, `/_admin/gc`)
+  needs `Authorization: Bearer $S3OS_ADMIN_TOKEN` when auth is on, and is
+  disabled if no token is set.
+* **Metrics** are served at `/_metrics` on every process:
+
+  | Process | Metrics |
+  |---|---|
+  | gateway | `s3_requests_total{op,code}`, `s3_request_duration_seconds{op}` (histogram), `s3_bytes_in_total`, `s3_bytes_out_total` |
+  | gateway | `storage_shard_read_failures_total{node,reason}`, `storage_nodes_down` |
+  | gateway | `repair_queue_depth`, `repair_shards_rebuilt_total`, `repair_chunks_unrecoverable_total`, `repair_passes_total`, `gc_shards_deleted_total`, `gc_bytes_freed_total` |
+  | storage nodes | request counts and latency for the shard API |
+  | metadata nodes | the same, plus `raft_is_leader`, `raft_term`, `raft_commit_index`, `raft_applied_index`, `raft_last_snapshot_index` |
+
+  Every process also exports Go runtime and process metrics.
+* **Logs** are JSON (`log/slog`), one line per S3 request with request id,
+  operation, bucket, key, access key, remote address, status, bytes in/out
+  and duration. Use `-log-level` to change verbosity.
+
 ## Key design decisions
 
 1. **Chunks.** Objects are split into chunks of at most 4 MiB. A read loads
@@ -217,6 +256,8 @@ internal/storagenode             storage node HTTP API and client (end-to-end ve
 internal/rebalance               moves shards to match the ring after membership changes
 internal/repair                  rebuilds missing/corrupt shards (copy or Reed-Solomon reconstruct)
 internal/gc                      mark-and-sweep deletion of unreferenced shards
+internal/sigv4                   AWS Signature V4 verification (header, presigned, streaming chunks)
+internal/metrics                 Prometheus metrics
 internal/gateway                 assembles metadata, data plane, S3 API and admin endpoints
 internal/httpserv                shared HTTP lifecycle, health checks, probes
 test/integration                 aws-sdk-go-v2 suite against an in-process gateway
@@ -243,7 +284,9 @@ aws --endpoint-url http://localhost:9000 s3 cp ./file.txt s3://demo/file.txt
 aws --endpoint-url http://localhost:9000 s3 ls s3://demo/
 ```
 
-Any access key works until SigV4 lands in M6. `aws s3 cp` uploads files of
+docker-compose starts the gateway with the development credentials
+`test-access-key` / `test-secret-key` (set them with `aws configure` or
+`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`). `aws s3 cp` uploads files of
 8 MiB or more with multipart.
 
 ## Testing
