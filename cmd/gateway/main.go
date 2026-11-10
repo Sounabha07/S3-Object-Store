@@ -26,6 +26,7 @@ func main() {
 	repairInterval := flag.Duration("repair-interval", 10*time.Minute, "background repair pass interval (0 disables)")
 	deepRepair := flag.Bool("deep-repair", false, "repair verifies every shard's contents, not just presence")
 	gcInterval := flag.Duration("gc-interval", time.Hour, "background garbage collection interval (0 disables)")
+	erasure := flag.Bool("erasure", true, "erasure code objects >= 1 MiB (RS 4+2) when there are >= 6 storage nodes; false replicates everything 3x")
 	gcGrace := flag.Duration("gc-grace", time.Hour, "minimum age of an unreferenced shard before GC deletes it")
 	// Secrets come from the environment so they do not appear in process
 	// listings: S3OS_CREDENTIALS="accesskey:secret,..." and S3OS_ADMIN_TOKEN.
@@ -52,7 +53,7 @@ func main() {
 			g, err := gateway.New(gateway.Config{
 				DataDir: *dataDir, MetaEndpoints: meta, StorageNodes: nodes, ChunkSize: *chunkSize, Log: log,
 				RepairInterval: *repairInterval, DeepRepair: *deepRepair, GCInterval: *gcInterval, GCGrace: *gcGrace,
-				Credentials: creds, AdminToken: os.Getenv("S3OS_ADMIN_TOKEN"),
+				Credentials: creds, AdminToken: os.Getenv("S3OS_ADMIN_TOKEN"), DisableErasure: !*erasure,
 			})
 			if err != nil {
 				return httpserv.Setup{}, err

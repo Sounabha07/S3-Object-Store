@@ -33,14 +33,17 @@ services:
     <<: *meta
     command: ["metadata", "-id", "meta-1", "-listen", ":7000", "-raft-bind", ":7001", "-data", "/data", "-peers", *peers]
     volumes: [meta-1:/data]
+    ports: ["127.0.0.1:7101:7000"] # status/metrics for scripts on the host
   meta-2:
     <<: *meta
     command: ["metadata", "-id", "meta-2", "-listen", ":7000", "-raft-bind", ":7001", "-data", "/data", "-peers", *peers]
     volumes: [meta-2:/data]
+    ports: ["127.0.0.1:7102:7000"]
   meta-3:
     <<: *meta
     command: ["metadata", "-id", "meta-3", "-listen", ":7000", "-raft-bind", ":7001", "-data", "/data", "-peers", *peers]
     volumes: [meta-3:/data]
+    ports: ["127.0.0.1:7103:7000"]
 
   storage-1:
     <<: *storage
@@ -71,7 +74,7 @@ services:
     <<: *node
     # Stateless: metadata in the Raft cluster, 3 replicas of every chunk
     # across the six storage nodes.
-    command: ["gateway", "-listen", ":9000", "-data", "/data",
+    command: ["gateway", "-listen", ":9000", "-data", "/data", "-erasure=${S3OS_ERASURE:-true}",
               "-meta", "http://meta-1:7000,http://meta-2:7000,http://meta-3:7000",
               "-storage", "storage-1=http://storage-1:8000,storage-2=http://storage-2:8000,storage-3=http://storage-3:8000,storage-4=http://storage-4:8000,storage-5=http://storage-5:8000,storage-6=http://storage-6:8000"]
     ports: ["9000:9000"]

@@ -1,0 +1,58 @@
+=== RUN   TestChaos
+    chaos_test.go:239: phase: kill one storage node (storage-2)
+    chaos_test.go:252:   recovery 153.3102ms
+    chaos_test.go:239: phase: kill two storage nodes (storage-3, storage-5)
+    chaos_test.go:252:   recovery 194.958ms
+    chaos_test.go:239: phase: kill the Raft leader
+    chaos_test.go:252:   recovery 3.5731238s
+    chaos_test.go:239: phase: partition a storage node (storage-4)
+    chaos_test.go:252:   recovery 2.2228221s
+    chaos_test.go:239: phase: partition the Raft leader
+    chaos_test.go:252:   recovery 3.0127716s
+    chaos_test.go:239: phase: corrupt 40 shard files on storage-1
+    chaos_test.go:252:   recovery 169.7225ms
+    chaos_test.go:324: report:
+        {
+          "started": "2026-11-10T07:58:32.1243071Z",
+          "phases": [
+            {
+              "name": "kill one storage node (storage-2)",
+              "recovery_ms": 153.31
+            },
+            {
+              "name": "kill two storage nodes (storage-3, storage-5)",
+              "recovery_ms": 194.958
+            },
+            {
+              "name": "kill the Raft leader",
+              "recovery_ms": 3573.123,
+              "note": "killed meta-1"
+            },
+            {
+              "name": "partition a storage node (storage-4)",
+              "recovery_ms": 2222.822
+            },
+            {
+              "name": "partition the Raft leader",
+              "recovery_ms": 3012.771,
+              "note": "partitioned meta-3"
+            },
+            {
+              "name": "corrupt 40 shard files on storage-1",
+              "recovery_ms": 169.722,
+              "note": "corrupted 40 files"
+            }
+          ],
+          "objects_written_acknowledged": 2158,
+          "objects_verified": 2158,
+          "mismatches": 0,
+          "unreadable": 0,
+          "write_errors_during_faults": 124,
+          "reads_ok_during_faults": 988,
+          "read_errors_during_faults": 1,
+          "read_mismatches_during_faults": 0,
+          "corrupt_shard_reads_detected": 24
+        }
+--- PASS: TestChaos (196.15s)
+PASS
+ok  	github.com/Sounabha07/S3-Object-Store/test/chaos	196.971s
