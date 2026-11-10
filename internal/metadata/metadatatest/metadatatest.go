@@ -29,6 +29,7 @@ func Run(t *testing.T, newMeta func(t *testing.T) metadata.Metadata) {
 	t.Run("ListBadToken", func(t *testing.T) { testBadToken(t, newMeta(t)) })
 	t.Run("WalkChunks", func(t *testing.T) { testWalkChunks(t, newMeta(t)) })
 	t.Run("NotImplemented", func(t *testing.T) { testNotImplemented(t, newMeta(t)) })
+	t.Run("UpdateShardLocation", func(t *testing.T) { testUpdateShardLocation(t, newMeta(t)) })
 }
 
 // Object returns a minimal object for bucket/key with one single-copy chunk.
@@ -259,8 +260,44 @@ func testNotImplemented(t *testing.T, m metadata.Metadata) {
 	if _, err := m.CreateMultipart(ctx, "b", "k", metadata.UploadMeta{}); !errors.Is(err, metadata.ErrNotImplemented) {
 		t.Fatal(err)
 	}
-	if err := m.UpdateShardLocation(ctx, metadata.ShardLocationUpdate{}); !errors.Is(err, metadata.ErrNotImplemented) {
-		t.Fatal(err)
+}
+
+func testUpdateShardLocation(t *testing.T, m metadata.Metadata) {
+	MustCreateBucket(t, m, "b")
+	obj := MustPut(t, m, "b", "k") // one chunk, one shard on "local"
+	u := metadata.ShardLocationUpdate{Bucket: "b", Key: "k", VersionID: obj.VersionID, From: "local", To: "storage-2"}
+	if err := m.UpdateShardLocation(ctx, u); err != nil {
+		t.Fatalf("UpdateShardLocation: %v", err)
+	}
+	got, err := m.GetObject(ctx, "b", "k")
+	if err != nil || got.Chunks[0].Shards[0].Node != "storage-2" {
+		t.Fatalf("after move: node %q, err %v", got.Chunks[0].Shards[0].Node, err)
+	}
+	// Replaying the same move conflicts: the shard is no longer on From.
+	if err := m.UpdateShardLocation(ctx, u); !errors.Is(err, metadata.ErrShardLocationConflict) {
+		t.Fatalf("stale move: %v, want ErrShardLocationConflict", err)
+	}
+	// A move against an overwritten object conflicts.
+	stale := u
+	stale.From, stale.To = "storage-2", "storage-3"
+	stale.VersionID = "old-version"
+	if err := m.UpdateShardLocation(ctx, stale); !errors.Is(err, metadata.ErrShardLocationConflict) {
+		t.Fatalf("move of an old version: %v, want ErrShardLocationConflict", err)
+	}
+	cases := []struct {
+		u    metadata.ShardLocationUpdate
+		want error
+	}{
+		{metadata.ShardLocationUpdate{Bucket: "nope", Key: "k", To: "x"}, metadata.ErrNoSuchBucket},
+		{metadata.ShardLocationUpdate{Bucket: "b", Key: "nope", To: "x"}, metadata.ErrNoSuchKey},
+		{metadata.ShardLocationUpdate{Bucket: "b", Key: "k", VersionID: obj.VersionID, ChunkIndex: 5, From: "storage-2", To: "x"}, metadata.ErrInvalidArgument},
+		{metadata.ShardLocationUpdate{Bucket: "b", Key: "k", VersionID: obj.VersionID, ShardIndex: 9, From: "storage-2", To: "x"}, metadata.ErrInvalidArgument},
+		{metadata.ShardLocationUpdate{Bucket: "b", Key: "k"}, metadata.ErrInvalidArgument},
+	}
+	for _, c := range cases {
+		if err := m.UpdateShardLocation(ctx, c.u); !errors.Is(err, c.want) {
+			t.Errorf("%+v: err = %v, want %v", c.u, err, c.want)
+		}
 	}
 }
 

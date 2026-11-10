@@ -64,6 +64,8 @@ const (
 	OpDeleteBucket Op = "DeleteBucket"
 	OpPutObject    Op = "PutObject"
 	OpDeleteObject Op = "DeleteObject"
+
+	OpUpdateShardLocation Op = "UpdateShardLocation"
 )
 
 // Command is one deterministic mutation. It is the payload of a Raft log
@@ -74,6 +76,8 @@ type Command struct {
 	Key    string               `json:"key,omitempty"`
 	Time   time.Time            `json:"time,omitzero"`
 	Object *metadata.ObjectMeta `json:"object,omitempty"`
+
+	Update *metadata.ShardLocationUpdate `json:"update,omitempty"`
 }
 
 // Validate checks a command before it is proposed, so malformed commands
@@ -83,6 +87,10 @@ func (c Command) Validate() error {
 	case OpCreateBucket:
 		if c.Bucket == "" || !utf8.ValidString(c.Bucket) {
 			return fmt.Errorf("%w: invalid bucket name", metadata.ErrInvalidArgument)
+		}
+	case OpUpdateShardLocation:
+		if c.Update == nil || c.Update.Bucket == "" || c.Update.Key == "" || c.Update.To == "" {
+			return fmt.Errorf("%w: incomplete shard location update", metadata.ErrInvalidArgument)
 		}
 	case OpDeleteBucket, OpDeleteObject:
 		if c.Bucket == "" {
@@ -249,8 +257,50 @@ func applyTx(tx *bolt.Tx, cmd Command) (result, fatal error) {
 			return nil, nil
 		}
 		return nil, b.Delete([]byte(cmd.Key))
+
+	case OpUpdateShardLocation:
+		return updateShardLocation(objects, cmd.Update)
 	}
 	return fmt.Errorf("%w: unknown op %q", metadata.ErrInvalidArgument, cmd.Op), nil
+}
+
+// updateShardLocation moves one shard reference from u.From to u.To. It is
+// conditional: if the object was overwritten (different version) or the
+// shard no longer lives on u.From, nothing changes and
+// ErrShardLocationConflict is returned, so a slow repair or rebalance can
+// never undo a newer write or a newer move.
+func updateShardLocation(objects *bolt.Bucket, u *metadata.ShardLocationUpdate) (result, fatal error) {
+	b := objects.Bucket([]byte(u.Bucket))
+	if b == nil {
+		return metadata.ErrNoSuchBucket, nil
+	}
+	v := b.Get([]byte(u.Key))
+	if v == nil {
+		return metadata.ErrNoSuchKey, nil
+	}
+	var obj metadata.ObjectMeta
+	if err := json.Unmarshal(v, &obj); err != nil {
+		return nil, err
+	}
+	if obj.VersionID != u.VersionID {
+		return fmt.Errorf("%w: object version changed", metadata.ErrShardLocationConflict), nil
+	}
+	if u.ChunkIndex < 0 || u.ChunkIndex >= len(obj.Chunks) {
+		return fmt.Errorf("%w: chunk index %d out of range", metadata.ErrInvalidArgument, u.ChunkIndex), nil
+	}
+	shards := obj.Chunks[u.ChunkIndex].Shards
+	if u.ShardIndex < 0 || u.ShardIndex >= len(shards) {
+		return fmt.Errorf("%w: shard index %d out of range", metadata.ErrInvalidArgument, u.ShardIndex), nil
+	}
+	if shards[u.ShardIndex].Node != u.From {
+		return fmt.Errorf("%w: shard is on %s, not %s", metadata.ErrShardLocationConflict, shards[u.ShardIndex].Node, u.From), nil
+	}
+	shards[u.ShardIndex].Node = u.To
+	nv, err := json.Marshal(obj)
+	if err != nil {
+		return nil, err
+	}
+	return nil, b.Put([]byte(u.Key), nv)
 }
 
 func appliedIndex(sys *bolt.Bucket) uint64 {
@@ -599,9 +649,12 @@ func (s *Store) AbortMultipart(context.Context, string) error {
 	return metadata.ErrNotImplemented
 }
 
-// UpdateShardLocation is not implemented until M3.
-func (s *Store) UpdateShardLocation(context.Context, metadata.ShardLocationUpdate) error {
-	return metadata.ErrNotImplemented
+// UpdateShardLocation implements metadata.Metadata (see updateShardLocation).
+func (s *Store) UpdateShardLocation(ctx context.Context, u metadata.ShardLocationUpdate) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.Apply(0, Command{Op: OpUpdateShardLocation, Update: &u})
 }
 
 // WalkChunks implements metadata.Metadata. It runs inside one read

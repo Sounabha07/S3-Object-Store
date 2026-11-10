@@ -29,6 +29,8 @@ jobs:
         run: go tool cover -func=coverage.out | tail -1
       - name: S3 integration suite against Raft metadata
         run: S3OS_IT_META=raft go test -race -count=1 ./test/integration
+      - name: S3 integration suite against Raft metadata and 6 storage nodes
+        run: S3OS_IT_META=raft S3OS_IT_STORAGE=cluster go test -race -count=1 ./test/integration
 
   govulncheck:
     name: govulncheck
@@ -73,8 +75,8 @@ jobs:
         run: bash scripts/smoke.sh http://localhost:9000
       - name: aws CLI smoke test against the cluster
         run: bash scripts/awscli-smoke.sh http://localhost:9000
-      - name: smoke test with each metadata node stopped
-        run: bash scripts/meta-failover-smoke.sh http://localhost:9000
+      - name: smoke test with each metadata and storage node stopped
+        run: bash scripts/failover-smoke.sh http://localhost:9000
       - name: logs on failure
         if: failure()
         run: docker compose -f deploy/docker-compose.yml logs

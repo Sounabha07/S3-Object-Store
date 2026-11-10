@@ -31,7 +31,7 @@ func newPlane(t *testing.T, chunkSize int64) (*Plane, *disk.Disk, string) {
 
 func write(t *testing.T, p *Plane, data []byte) metadata.ObjectMeta {
 	t.Helper()
-	res, err := p.Write(ctx, bytes.NewReader(data), -1)
+	res, err := p.Write(ctx, bytes.NewReader(data), -1, "b/k/v")
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}
@@ -54,7 +54,7 @@ func TestWriteChunking(t *testing.T) {
 	for _, c := range cases {
 		p, _, _ := newPlane(t, chunk)
 		data := storagetest.RandomBytes(t, c.size)
-		res, err := p.Write(ctx, bytes.NewReader(data), -1)
+		res, err := p.Write(ctx, bytes.NewReader(data), -1, "b/k/v")
 		if err != nil {
 			t.Fatalf("size %d: %v", c.size, err)
 		}
@@ -203,11 +203,11 @@ func TestMissingShard(t *testing.T) {
 
 func TestWriteSizeLimit(t *testing.T) {
 	p, _, _ := newPlane(t, 10)
-	if _, err := p.Write(ctx, bytes.NewReader(make([]byte, 25)), 25); err != nil {
+	if _, err := p.Write(ctx, bytes.NewReader(make([]byte, 25)), 25, "b/k/v"); err != nil {
 		t.Fatalf("at limit: %v", err)
 	}
 	for _, size := range []int{26, 35} {
-		if _, err := p.Write(ctx, bytes.NewReader(make([]byte, size)), 25); !errors.Is(err, ErrTooLarge) {
+		if _, err := p.Write(ctx, bytes.NewReader(make([]byte, size)), 25, "b/k/v"); !errors.Is(err, ErrTooLarge) {
 			t.Fatalf("size %d over limit 25: err = %v, want ErrTooLarge", size, err)
 		}
 	}
@@ -232,7 +232,7 @@ func (f *failAfter) Read(b []byte) (int, error) {
 
 func TestWriteBodyError(t *testing.T) {
 	p, _, _ := newPlane(t, 10)
-	_, err := p.Write(ctx, &failAfter{r: bytes.NewReader(make([]byte, 100)), n: 15}, -1)
+	_, err := p.Write(ctx, &failAfter{r: bytes.NewReader(make([]byte, 100)), n: 15}, -1, "b/k/v")
 	if err == nil {
 		t.Fatal("Write with failing body succeeded")
 	}
