@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Smoke test with the unmodified aws CLI (--endpoint-url), against a running
-# gateway. Objects stay under the CLI's 8 MiB multipart threshold because
-# multipart upload arrives in M5.
+# gateway. The 20 MiB file exceeds the CLI's 8 MiB threshold, so it is sent
+# as a multipart upload; the small file as a single PUT.
 # Usage: scripts/awscli-smoke.sh [endpoint]   (default http://localhost:9000)
 set -euo pipefail
 
@@ -19,7 +19,7 @@ aws --version
 s3 s3 mb "s3://$BUCKET"
 s3 s3 ls | grep -q "$BUCKET"
 
-head -c $((5 * 1024 * 1024 + 7)) /dev/urandom > "$TMP/a.bin"
+head -c $((20 * 1024 * 1024 + 7)) /dev/urandom > "$TMP/a.bin"
 echo "hello from the aws cli" > "$TMP/b.txt"
 s3 s3 cp "$TMP/a.bin" "s3://$BUCKET/data/a.bin"
 s3 s3 cp "$TMP/b.txt" "s3://$BUCKET/data/b.txt"

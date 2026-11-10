@@ -15,8 +15,11 @@ import (
 	"github.com/Sounabha07/S3-Object-Store/internal/metadata"
 )
 
-// MaxObjectSize is the largest single PutObject S3 accepts (5 GiB).
+// MaxObjectSize is the largest single PutObject (or part) S3 accepts (5 GiB).
 const MaxObjectSize = 5 << 30
+
+// MinPartSize is S3's minimum size for every multipart part but the last.
+const MinPartSize = 5 << 20
 
 // Config configures a Server.
 type Config struct {
@@ -24,6 +27,7 @@ type Config struct {
 	Data          *dataplane.Plane
 	Log           *slog.Logger
 	MaxObjectSize int64 // 0 means MaxObjectSize
+	MinPartSize   int64 // 0 means MinPartSize (5 MiB); every part but the last must be this big
 }
 
 // Server is an http.Handler serving the S3 API.
@@ -32,6 +36,7 @@ type Server struct {
 	data          *dataplane.Plane
 	log           *slog.Logger
 	maxObjectSize int64
+	minPartSize   int64
 	now           func() time.Time
 }
 
@@ -47,6 +52,10 @@ func New(cfg Config) *Server {
 	if s.maxObjectSize <= 0 {
 		s.maxObjectSize = MaxObjectSize
 	}
+	s.minPartSize = cfg.MinPartSize
+	if s.minPartSize <= 0 {
+		s.minPartSize = MinPartSize
+	}
 	if s.log == nil {
 		s.log = slog.New(slog.DiscardHandler)
 	}
@@ -59,9 +68,9 @@ func New(cfg Config) *Server {
 var unsupportedSubresources = []string{
 	"accelerate", "acl", "analytics", "attributes", "cors", "delete", "encryption",
 	"intelligent-tiering", "inventory", "legal-hold", "lifecycle", "logging", "metrics",
-	"notification", "object-lock", "ownershipControls", "partNumber", "policy",
+	"notification", "object-lock", "ownershipControls", "policy",
 	"policyStatus", "publicAccessBlock", "replication", "requestPayment", "restore",
-	"retention", "select", "tagging", "torrent", "uploadId", "uploads", "versioning",
+	"retention", "select", "tagging", "torrent", "versioning",
 	"versionId", "versions", "website",
 }
 
@@ -115,6 +124,10 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, req *request) {
 	}
 
 	if key == "" {
+		if q.Has("uploads") {
+			s.writeError(w, r, req, ErrNotImplemented.withMessage("ListMultipartUploads is not implemented."))
+			return
+		}
 		switch r.Method {
 		case http.MethodPut:
 			s.createBucket(w, r, req)
@@ -139,6 +152,10 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request, req *request) {
 
 	if apiErr := checkKey(key); apiErr != nil {
 		s.writeError(w, r, req, apiErr)
+		return
+	}
+	if q.Has("uploadId") || q.Has("uploads") || q.Has("partNumber") {
+		s.routeMultipart(w, r, req, q)
 		return
 	}
 	switch r.Method {

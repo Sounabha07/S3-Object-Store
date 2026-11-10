@@ -10,6 +10,7 @@ import (
 	"flag"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/Sounabha07/S3-Object-Store/internal/dataplane"
 	"github.com/Sounabha07/S3-Object-Store/internal/gateway"
@@ -21,6 +22,10 @@ func main() {
 	chunkSize := flag.Int64("chunk-size", dataplane.DefaultChunkSize, "maximum chunk size in bytes")
 	metaEndpoints := flag.String("meta", "", "comma-separated metadata node URLs (empty: local metadata)")
 	storageNodes := flag.String("storage", "", "storage nodes as id=url,... (empty: local disk)")
+	repairInterval := flag.Duration("repair-interval", 10*time.Minute, "background repair pass interval (0 disables)")
+	deepRepair := flag.Bool("deep-repair", false, "repair verifies every shard's contents, not just presence")
+	gcInterval := flag.Duration("gc-interval", time.Hour, "background garbage collection interval (0 disables)")
+	gcGrace := flag.Duration("gc-grace", time.Hour, "minimum age of an unreferenced shard before GC deletes it")
 
 	httpserv.Main(httpserv.Service{
 		Name:        "gateway",
@@ -36,6 +41,7 @@ func main() {
 			}
 			g, err := gateway.New(gateway.Config{
 				DataDir: *dataDir, MetaEndpoints: meta, StorageNodes: nodes, ChunkSize: *chunkSize, Log: log,
+				RepairInterval: *repairInterval, DeepRepair: *deepRepair, GCInterval: *gcInterval, GCGrace: *gcGrace,
 			})
 			if err != nil {
 				return httpserv.Setup{}, err

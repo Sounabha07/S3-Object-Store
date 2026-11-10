@@ -49,6 +49,11 @@ var (
 	ErrNoSuchKey               = &APIError{"NoSuchKey", "The specified key does not exist.", http.StatusNotFound}
 	ErrNotImplemented          = &APIError{"NotImplemented", "A header or query you provided implies functionality that is not implemented.", http.StatusNotImplemented}
 	ErrPreconditionFailed      = &APIError{"PreconditionFailed", "At least one of the pre-conditions you specified did not hold", http.StatusPreconditionFailed}
+	ErrNoSuchUpload            = &APIError{"NoSuchUpload", "The specified multipart upload does not exist. The upload ID might be invalid, or the multipart upload might have been aborted or completed.", http.StatusNotFound}
+	ErrInvalidPart             = &APIError{"InvalidPart", "One or more of the specified parts could not be found. The part might not have been uploaded, or the specified entity tag might not have matched the part's entity tag.", http.StatusBadRequest}
+	ErrInvalidPartOrder        = &APIError{"InvalidPartOrder", "The list of parts was not in ascending order. The parts list must be specified in order by part number.", http.StatusBadRequest}
+	ErrEntityTooSmall          = &APIError{"EntityTooSmall", "Your proposed upload is smaller than the minimum allowed object size.", http.StatusBadRequest}
+	ErrMalformedXML            = &APIError{"MalformedXML", "The XML you provided was not well-formed or did not validate against our published schema.", http.StatusBadRequest}
 	ErrServiceUnavailable      = &APIError{"ServiceUnavailable", "Please reduce your request rate.", http.StatusServiceUnavailable}
 	ErrSHA256Mismatch          = &APIError{"XAmzContentSHA256Mismatch", "The provided 'x-amz-content-sha256' header does not match what was computed.", http.StatusBadRequest}
 )
@@ -79,6 +84,14 @@ func toAPIError(err error) *APIError {
 		return ErrBucketNotEmpty
 	case errors.Is(err, metadata.ErrInvalidArgument):
 		return ErrInvalidArgument
+	case errors.Is(err, metadata.ErrNoSuchUpload):
+		return ErrNoSuchUpload
+	case errors.Is(err, metadata.ErrInvalidPartOrder):
+		return ErrInvalidPartOrder
+	case errors.Is(err, metadata.ErrInvalidPart):
+		return ErrInvalidPart
+	case errors.Is(err, metadata.ErrEntityTooSmall):
+		return ErrEntityTooSmall
 	case errors.Is(err, metadata.ErrNotImplemented):
 		return ErrNotImplemented
 	case errors.Is(err, metadata.ErrUnavailable),

@@ -427,6 +427,20 @@ func (n *Node) WalkChunks(ctx context.Context, fn func(bucket, key, versionID st
 	return n.store.WalkChunks(ctx, fn)
 }
 
+func (n *Node) GetUpload(ctx context.Context, uploadID string) (metadata.UploadInfo, error) {
+	if err := n.linearize(ctx); err != nil {
+		return metadata.UploadInfo{}, err
+	}
+	return n.store.GetUpload(ctx, uploadID)
+}
+
+func (n *Node) ListParts(ctx context.Context, uploadID string, opts metadata.ListPartsOptions) (metadata.ListPartsResult, error) {
+	if err := n.linearize(ctx); err != nil {
+		return metadata.ListPartsResult{}, err
+	}
+	return n.store.ListParts(ctx, uploadID, opts)
+}
+
 // Status describes the node for operators and tests.
 type Status struct {
 	ID                string `json:"id"`

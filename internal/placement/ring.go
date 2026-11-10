@@ -109,12 +109,13 @@ func (r *Ring) Pick(key string, n int, exclude ...NodeID) ([]NodeID, error) {
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	eligible := len(r.vnodes)
+	excluded := make(map[NodeID]bool, len(exclude))
 	for _, e := range exclude {
 		if _, ok := r.vnodes[e]; ok {
-			eligible--
+			excluded[e] = true // a node listed twice is excluded once
 		}
 	}
+	eligible := len(r.vnodes) - len(excluded)
 	if eligible < n {
 		return nil, ErrNotEnoughNodes
 	}

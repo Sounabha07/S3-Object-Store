@@ -5,6 +5,7 @@ package metadatatest
 
 import (
 	"context"
+	"crypto/md5" // #nosec G501 -- test ETags, as in S3
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -28,7 +29,9 @@ func Run(t *testing.T, newMeta func(t *testing.T) metadata.Metadata) {
 	t.Run("ListPaginationMatchesReference", func(t *testing.T) { testPaginationReference(t, newMeta(t)) })
 	t.Run("ListBadToken", func(t *testing.T) { testBadToken(t, newMeta(t)) })
 	t.Run("WalkChunks", func(t *testing.T) { testWalkChunks(t, newMeta(t)) })
-	t.Run("NotImplemented", func(t *testing.T) { testNotImplemented(t, newMeta(t)) })
+	t.Run("MultipartLifecycle", func(t *testing.T) { testMultipartLifecycle(t, newMeta(t)) })
+	t.Run("MultipartCompleteErrors", func(t *testing.T) { testMultipartErrors(t, newMeta(t)) })
+	t.Run("MultipartAbort", func(t *testing.T) { testMultipartAbort(t, newMeta(t)) })
 	t.Run("UpdateShardLocation", func(t *testing.T) { testUpdateShardLocation(t, newMeta(t)) })
 }
 
@@ -256,9 +259,173 @@ func testWalkChunks(t *testing.T, m metadata.Metadata) {
 	}
 }
 
-func testNotImplemented(t *testing.T, m metadata.Metadata) {
-	if _, err := m.CreateMultipart(ctx, "b", "k", metadata.UploadMeta{}); !errors.Is(err, metadata.ErrNotImplemented) {
+// Part returns a part with one chunk whose content is identified by tag.
+func Part(n int, size int64, tag string) metadata.PartMeta {
+	sum := md5.Sum([]byte(tag)) // #nosec G401 -- test ETag
+	return metadata.PartMeta{
+		PartNumber: n, Size: size, ETag: fmt.Sprintf(`"%x"`, sum),
+		LastModified: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		Chunks: []metadata.Chunk{{Size: size, Scheme: metadata.Single, Shards: []metadata.ShardRef{
+			{ID: storage.ComputeShardID([]byte(tag)), Size: size, Node: "local"},
+		}}},
+	}
+}
+
+func completed(parts ...metadata.PartMeta) []metadata.CompletedPart {
+	var out []metadata.CompletedPart
+	for _, p := range parts {
+		out = append(out, metadata.CompletedPart{PartNumber: p.PartNumber, ETag: p.ETag})
+	}
+	return out
+}
+
+func testMultipartLifecycle(t *testing.T, m metadata.Metadata) {
+	if _, err := m.CreateMultipart(ctx, "nope", "k", metadata.UploadMeta{}); !errors.Is(err, metadata.ErrNoSuchBucket) {
+		t.Fatalf("CreateMultipart in missing bucket: %v", err)
+	}
+	MustCreateBucket(t, m, "b")
+	meta := metadata.UploadMeta{ContentType: "video/mp4", UserMeta: map[string]string{"a": "1"}}
+	id, err := m.CreateMultipart(ctx, "b", "big", meta)
+	if err != nil || id == "" {
+		t.Fatalf("CreateMultipart: %q, %v", id, err)
+	}
+	up, err := m.GetUpload(ctx, id)
+	if err != nil || up.Bucket != "b" || up.Key != "big" || up.Meta.ContentType != "video/mp4" || up.Initiated.IsZero() {
+		t.Fatalf("GetUpload = %+v, %v", up, err)
+	}
+
+	p1, p2old, p2, p3 := Part(1, 100, "one"), Part(2, 50, "two-old"), Part(2, 100, "two"), Part(3, 7, "three")
+	for _, p := range []metadata.PartMeta{p3, p1, p2old, p2} { // out of order; part 2 replaced
+		if err := m.PutPart(ctx, id, p); err != nil {
+			t.Fatalf("PutPart %d: %v", p.PartNumber, err)
+		}
+	}
+	page, err := m.ListParts(ctx, id, metadata.ListPartsOptions{MaxParts: 2})
+	if err != nil || len(page.Parts) != 2 || !page.IsTruncated || page.Parts[0].PartNumber != 1 || page.Parts[1].ETag != p2.ETag {
+		t.Fatalf("ListParts page 1 = %+v, %v", page, err)
+	}
+	page, err = m.ListParts(ctx, id, metadata.ListPartsOptions{PartNumberMarker: page.NextPartNumberMarker})
+	if err != nil || len(page.Parts) != 1 || page.IsTruncated || page.Parts[0].PartNumber != 3 || page.Bucket != "b" || page.Key != "big" {
+		t.Fatalf("ListParts page 2 = %+v, %v", page, err)
+	}
+	seen := 0
+	if err := m.WalkPartChunks(ctx, func(u string, n int, c metadata.Chunk) error { seen++; return nil }); err != nil || seen != 3 {
+		t.Fatalf("WalkPartChunks visited %d (%v), want 3", seen, err)
+	}
+
+	res, err := m.CompleteMultipart(ctx, id, metadata.CompleteRequest{Parts: completed(p1, p2, p3), VersionID: "mpu-v1", MinPartSize: 100})
+	if err != nil {
+		t.Fatalf("CompleteMultipart: %v", err)
+	}
+	wantETag, _ := metadata.MultipartETag(completed(p1, p2, p3))
+	if res.ETag != wantETag || !strings.HasSuffix(res.ETag, `-3"`) || res.VersionID != "mpu-v1" {
+		t.Fatalf("Complete result %+v, want ETag %s", res, wantETag)
+	}
+	obj, err := m.GetObject(ctx, "b", "big")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if obj.Size != 207 || obj.ETag != wantETag || obj.ContentType != "video/mp4" || obj.UserMeta["a"] != "1" || len(obj.Chunks) != 3 {
+		t.Fatalf("assembled object %+v", obj)
+	}
+	for i, wantOff := range []int64{0, 100, 200} {
+		if obj.Chunks[i].Offset != wantOff {
+			t.Fatalf("chunk %d offset %d, want %d", i, obj.Chunks[i].Offset, wantOff)
+		}
+	}
+	if obj.Chunks[1].Shards[0].ID != p2.Chunks[0].Shards[0].ID {
+		t.Fatal("assembled object uses the replaced part 2")
+	}
+	if _, err := m.GetUpload(ctx, id); !errors.Is(err, metadata.ErrNoSuchUpload) {
+		t.Fatalf("upload still exists after completion: %v", err)
+	}
+	seen = 0
+	_ = m.WalkPartChunks(ctx, func(string, int, metadata.Chunk) error { seen++; return nil })
+	if seen != 0 {
+		t.Fatalf("WalkPartChunks still visits %d chunks after completion", seen)
+	}
+}
+
+func testMultipartErrors(t *testing.T, m metadata.Metadata) {
+	MustCreateBucket(t, m, "b")
+	id, err := m.CreateMultipart(ctx, "b", "k", metadata.UploadMeta{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p1, p2, p3 := Part(1, 10, "1"), Part(2, 100, "2"), Part(3, 100, "3")
+	for _, p := range []metadata.PartMeta{p1, p2, p3} {
+		if err := m.PutPart(ctx, id, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wrongETag := completed(p2)
+	wrongETag[0].ETag = p3.ETag
+	cases := []struct {
+		name  string
+		parts []metadata.CompletedPart
+		min   int64
+		want  error
+	}{
+		{"descending", completed(p3, p2), 0, metadata.ErrInvalidPartOrder},
+		{"duplicate", completed(p2, p2), 0, metadata.ErrInvalidPartOrder},
+		{"missing part", []metadata.CompletedPart{{PartNumber: 7, ETag: p1.ETag}}, 0, metadata.ErrInvalidPart},
+		{"etag mismatch", wrongETag, 0, metadata.ErrInvalidPart},
+		{"small non-final part", completed(p1, p2), 50, metadata.ErrEntityTooSmall},
+	}
+	for _, c := range cases {
+		_, err := m.CompleteMultipart(ctx, id, metadata.CompleteRequest{Parts: c.parts, VersionID: "v", MinPartSize: c.min})
+		if !errors.Is(err, c.want) {
+			t.Errorf("%s: err = %v, want %v", c.name, err, c.want)
+		}
+	}
+	// Failed completions change nothing: the upload is still usable.
+	if _, err := m.GetObject(ctx, "b", "k"); !errors.Is(err, metadata.ErrNoSuchKey) {
+		t.Fatalf("object exists after failed completions: %v", err)
+	}
+	// A small final part is fine.
+	if _, err := m.CompleteMultipart(ctx, id, metadata.CompleteRequest{Parts: completed(p2, p3), VersionID: "v", MinPartSize: 100}); err != nil {
+		t.Fatalf("valid completion after failures: %v", err)
+	}
+	if _, err := m.CompleteMultipart(ctx, "no-such-upload", metadata.CompleteRequest{Parts: completed(p1), VersionID: "v"}); !errors.Is(err, metadata.ErrNoSuchUpload) {
+		t.Fatalf("unknown upload: %v", err)
+	}
+}
+
+func testMultipartAbort(t *testing.T, m metadata.Metadata) {
+	MustCreateBucket(t, m, "b")
+	id, err := m.CreateMultipart(ctx, "b", "k", metadata.UploadMeta{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.PutPart(ctx, id, Part(1, 10, "x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.AbortMultipart(ctx, id); err != nil {
+		t.Fatalf("Abort: %v", err)
+	}
+	if err := m.AbortMultipart(ctx, id); !errors.Is(err, metadata.ErrNoSuchUpload) {
+		t.Fatalf("second Abort: %v", err)
+	}
+	if err := m.PutPart(ctx, id, Part(2, 10, "y")); !errors.Is(err, metadata.ErrNoSuchUpload) {
+		t.Fatalf("PutPart after abort: %v", err)
+	}
+	if _, err := m.ListParts(ctx, id, metadata.ListPartsOptions{}); !errors.Is(err, metadata.ErrNoSuchUpload) {
+		t.Fatalf("ListParts after abort: %v", err)
+	}
+
+	// Deleting a bucket also discards its in-progress uploads.
+	id2, err := m.CreateMultipart(ctx, "b", "k2", metadata.UploadMeta{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.PutPart(ctx, id2, Part(1, 10, "z")); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.DeleteBucket(ctx, "b"); err != nil {
+		t.Fatalf("DeleteBucket with an in-progress upload: %v", err)
+	}
+	if _, err := m.GetUpload(ctx, id2); !errors.Is(err, metadata.ErrNoSuchUpload) {
+		t.Fatalf("upload survived its bucket: %v", err)
 	}
 }
 

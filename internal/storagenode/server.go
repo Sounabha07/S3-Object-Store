@@ -39,6 +39,7 @@ const (
 	codeCorrupt  = "Corrupt"
 	codeInvalid  = "Invalid"
 	codeInternal = "Internal"
+	codeModified = "Modified"
 )
 
 // shardInfoJSON is the wire form of storage.ShardInfo.
@@ -131,7 +132,27 @@ func Handler(store storage.Storage, log *slog.Logger) http.Handler {
 		if !ok {
 			return
 		}
-		if err := store.Delete(r.Context(), id); err != nil {
+		var err error
+		if v := r.URL.Query().Get("older-than"); v != "" {
+			ns, perr := strconv.ParseInt(v, 10, 64)
+			cd, ok := store.(storage.ConditionalDeleter)
+			switch {
+			case perr != nil:
+				writeErr(w, codeInvalid, http.StatusBadRequest, perr)
+				return
+			case !ok:
+				writeErr(w, codeInvalid, http.StatusNotImplemented, errors.New("conditional delete not supported"))
+				return
+			}
+			err = cd.DeleteIfOlder(r.Context(), id, time.Unix(0, ns))
+		} else {
+			err = store.Delete(r.Context(), id)
+		}
+		if errors.Is(err, storage.ErrModified) {
+			writeErr(w, codeModified, http.StatusConflict, err)
+			return
+		}
+		if err != nil {
 			storeErr(w, err, log)
 			return
 		}

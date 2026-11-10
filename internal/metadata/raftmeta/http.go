@@ -63,7 +63,19 @@ func Handler(n *Node) http.Handler {
 		})
 		respond(w, res, err)
 	})
-	mux.HandleFunc("GET /v1/chunks", func(w http.ResponseWriter, r *http.Request) { serveChunks(n, w, r) })
+	mux.HandleFunc("GET /v1/chunks", func(w http.ResponseWriter, r *http.Request) { serveChunks(n, w, r, false) })
+	mux.HandleFunc("GET /v1/partchunks", func(w http.ResponseWriter, r *http.Request) { serveChunks(n, w, r, true) })
+	mux.HandleFunc("GET /v1/upload", func(w http.ResponseWriter, r *http.Request) {
+		res, err := n.GetUpload(r.Context(), r.URL.Query().Get("id"))
+		respond(w, res, err)
+	})
+	mux.HandleFunc("GET /v1/parts", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		maxParts, _ := strconv.Atoi(q.Get("max"))
+		marker, _ := strconv.Atoi(q.Get("marker"))
+		res, err := n.ListParts(r.Context(), q.Get("upload"), metadata.ListPartsOptions{MaxParts: maxParts, PartNumberMarker: marker})
+		respond(w, res, err)
+	})
 	mux.HandleFunc("GET /v1/status", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, n.Status()) })
 	return mux
 }
@@ -76,21 +88,31 @@ type chunkRecord struct {
 	Key        string          `json:"key,omitempty"`
 	VersionID  string          `json:"version,omitempty"`
 	ChunkIndex int             `json:"index,omitempty"`
+	UploadID   string          `json:"upload,omitempty"`
+	PartNumber int             `json:"part,omitempty"`
 	Chunk      *metadata.Chunk `json:"chunk,omitempty"`
 	Done       bool            `json:"done,omitempty"`
 	Error      *wireError      `json:"error,omitempty"`
 }
 
-func serveChunks(n *Node, w http.ResponseWriter, r *http.Request) {
+// serveChunks streams object chunks, or in-progress part chunks if parts.
+func serveChunks(n *Node, w http.ResponseWriter, r *http.Request, parts bool) {
 	if err := n.linearize(r.Context()); err != nil {
 		writeError(w, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	enc := json.NewEncoder(w)
-	err := n.store.WalkChunks(r.Context(), func(bucket, key, version string, idx int, c metadata.Chunk) error {
-		return enc.Encode(chunkRecord{Bucket: bucket, Key: key, VersionID: version, ChunkIndex: idx, Chunk: &c})
-	})
+	var err error
+	if parts {
+		err = n.store.WalkPartChunks(r.Context(), func(uploadID string, part int, c metadata.Chunk) error {
+			return enc.Encode(chunkRecord{UploadID: uploadID, PartNumber: part, Chunk: &c})
+		})
+	} else {
+		err = n.store.WalkChunks(r.Context(), func(bucket, key, version string, idx int, c metadata.Chunk) error {
+			return enc.Encode(chunkRecord{Bucket: bucket, Key: key, VersionID: version, ChunkIndex: idx, Chunk: &c})
+		})
+	}
 	if err != nil {
 		_ = enc.Encode(chunkRecord{Error: &wireError{Code: errorCode(err), Message: err.Error()}})
 		return
@@ -124,7 +146,8 @@ func writeError(w http.ResponseWriter, err error) {
 		status = http.StatusServiceUnavailable
 	case errors.Is(err, metadata.ErrUnavailable):
 		status = http.StatusServiceUnavailable
-	case errors.Is(err, metadata.ErrInvalidArgument):
+	case errors.Is(err, metadata.ErrInvalidArgument), errors.Is(err, metadata.ErrInvalidPart),
+		errors.Is(err, metadata.ErrInvalidPartOrder), errors.Is(err, metadata.ErrEntityTooSmall):
 		status = http.StatusBadRequest
 	case errors.Is(err, metadata.ErrNoSuchBucket), errors.Is(err, metadata.ErrNoSuchKey), errors.Is(err, metadata.ErrNoSuchUpload):
 		status = http.StatusNotFound

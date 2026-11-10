@@ -11,6 +11,7 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Sounabha07/S3-Object-Store/internal/storage"
 )
@@ -27,6 +28,7 @@ func Run(t *testing.T, newStore func(t *testing.T) storage.Storage) {
 	t.Run("Walk", func(t *testing.T) { testWalk(t, newStore(t)) })
 	t.Run("ConcurrentPutsSameContent", func(t *testing.T) { testConcurrent(t, newStore(t)) })
 	t.Run("CancelledContext", func(t *testing.T) { testCancelled(t, newStore(t)) })
+	t.Run("ConditionalDelete", func(t *testing.T) { testConditionalDelete(t, newStore(t)) })
 	t.Run("Health", func(t *testing.T) {
 		if err := newStore(t).Health(context.Background()); err != nil {
 			t.Fatalf("Health: %v", err)
@@ -230,5 +232,43 @@ func testCancelled(t *testing.T, s storage.Storage) {
 	}
 	if _, err := s.Stat(context.Background(), storage.ComputeShardID(data)); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("shard stored despite cancelled put: %v", err)
+	}
+}
+
+// testConditionalDelete covers the guarantees garbage collection relies
+// on. Stores that do not implement storage.ConditionalDeleter skip it.
+func testConditionalDelete(t *testing.T, s storage.Storage) {
+	cd, ok := s.(storage.ConditionalDeleter)
+	if !ok {
+		t.Skip("store does not support conditional delete")
+	}
+	data := RandomBytes(t, 1000)
+	first := MustPut(t, s, data)
+
+	// A shard newer than the cutoff is kept.
+	if err := cd.DeleteIfOlder(context.Background(), first.ID, first.ModTime.Add(-time.Hour)); !errors.Is(err, storage.ErrModified) {
+		t.Fatalf("delete of a shard newer than the cutoff: %v, want ErrModified", err)
+	}
+	// Re-putting existing content refreshes its modification time, so a
+	// cutoff taken before the reuse no longer allows deletion.
+	time.Sleep(20 * time.Millisecond)
+	cutoff := time.Now()
+	time.Sleep(20 * time.Millisecond)
+	again := MustPut(t, s, data)
+	if !again.ModTime.After(first.ModTime) {
+		t.Fatalf("re-put did not refresh mod time: %v then %v", first.ModTime, again.ModTime)
+	}
+	if err := cd.DeleteIfOlder(context.Background(), first.ID, cutoff); !errors.Is(err, storage.ErrModified) {
+		t.Fatalf("delete after reuse: %v, want ErrModified", err)
+	}
+	// An old enough shard is deleted.
+	if err := cd.DeleteIfOlder(context.Background(), first.ID, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("delete of an old shard: %v", err)
+	}
+	if _, err := s.Stat(context.Background(), first.ID); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("shard still present: %v", err)
+	}
+	if err := cd.DeleteIfOlder(context.Background(), first.ID, time.Now()); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("delete of a missing shard: %v", err)
 	}
 }
