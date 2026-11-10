@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/Sounabha07/S3-Object-Store/internal/erasure"
 	"github.com/Sounabha07/S3-Object-Store/internal/metadata"
 	"github.com/Sounabha07/S3-Object-Store/internal/placement"
 	"github.com/Sounabha07/S3-Object-Store/internal/storage"
@@ -33,12 +34,23 @@ const DefaultChunkSize = 4 << 20
 // DefaultReplicas is the number of copies of each chunk in a cluster.
 const DefaultReplicas = 3
 
+// DefaultSmallObjectThreshold: objects smaller than this are replicated;
+// larger ones are erasure coded (when the cluster is wide enough).
+const DefaultSmallObjectThreshold = 1 << 20
+
+// DefaultErasure is the erasure-coding scheme for large objects.
+var DefaultErasure = metadata.EC42
+
 var (
 	// ErrTooLarge is returned by Write when the body exceeds the size limit.
 	ErrTooLarge = errors.New("dataplane: object too large")
 	// ErrInsufficientNodes means a chunk could not be stored with the
 	// required redundancy because too few nodes accepted it.
 	ErrInsufficientNodes = errors.New("dataplane: not enough healthy storage nodes")
+	// ErrChunkUnavailable means no replica (or too few erasure-coded
+	// shards) of a chunk could be read and verified. The wrapped causes say
+	// why (storage.ErrUnavailable, storage.ErrCorrupt, storage.ErrNotFound).
+	ErrChunkUnavailable = errors.New("dataplane: chunk unavailable")
 )
 
 // Config configures a Plane.
@@ -48,6 +60,13 @@ type Config struct {
 	Health    *Health             // nil: a new tracker with default cooldown
 	ChunkSize int64               // <= 0: DefaultChunkSize
 	Replicas  int                 // <= 0: min(DefaultReplicas, len(Nodes))
+
+	// Erasure is the scheme for objects of at least SmallObjectThreshold
+	// bytes. The zero value selects DefaultErasure when there are at least
+	// Data+Parity nodes; set DisableErasure to replicate everything.
+	Erasure              metadata.Scheme
+	DisableErasure       bool
+	SmallObjectThreshold int64 // <= 0: DefaultSmallObjectThreshold
 }
 
 // Plane reads and writes objects across a set of storage nodes.
@@ -59,6 +78,11 @@ type Plane struct {
 	chunkSize int64
 	replicas  int
 	bufs      sync.Pool // *[]byte of len chunkSize
+
+	ec        *erasure.Codec // nil: replicate everything
+	threshold int64
+	ecBufs    sync.Pool // *[]byte holding all shards of one default-scheme chunk
+	codecs    sync.Map  // metadata.Scheme -> *erasure.Codec, for reading any scheme
 }
 
 // NewCluster returns a Plane over cfg.Nodes.
@@ -94,7 +118,53 @@ func NewCluster(cfg Config) (*Plane, error) {
 		b := make([]byte, p.chunkSize)
 		return &b
 	}
+
+	p.threshold = cfg.SmallObjectThreshold
+	if p.threshold <= 0 {
+		p.threshold = DefaultSmallObjectThreshold
+	}
+	scheme := cfg.Erasure
+	if scheme == (metadata.Scheme{}) {
+		scheme = DefaultErasure
+	}
+	if !cfg.DisableErasure && len(cfg.Nodes) >= scheme.Total() {
+		codec, err := p.codec(scheme)
+		if err != nil {
+			return nil, err
+		}
+		p.ec = codec
+		size := codec.Total() * codec.ShardSize(int(p.chunkSize))
+		p.ecBufs.New = func() any {
+			b := make([]byte, size)
+			return &b
+		}
+	}
 	return p, nil
+}
+
+// codec returns a (cached) codec for scheme.
+func (p *Plane) codec(scheme metadata.Scheme) (*erasure.Codec, error) {
+	if c, ok := p.codecs.Load(scheme); ok {
+		return c.(*erasure.Codec), nil
+	}
+	c, err := erasure.New(scheme.Data, scheme.Parity)
+	if err != nil {
+		return nil, err
+	}
+	p.codecs.Store(scheme, c)
+	return c, nil
+}
+
+// Codec returns the codec for an erasure-coding scheme (used by repair).
+func (p *Plane) Codec(scheme metadata.Scheme) (*erasure.Codec, error) { return p.codec(scheme) }
+
+// Erasure returns the scheme used for large objects, or false if every
+// object is replicated.
+func (p *Plane) Erasure() (metadata.Scheme, bool) {
+	if p.ec == nil {
+		return metadata.Scheme{}, false
+	}
+	return metadata.Scheme{Data: p.ec.Data(), Parity: p.ec.Parity()}, true
 }
 
 // New returns a single-node Plane: every chunk is one shard on store,
@@ -163,9 +233,11 @@ type WriteResult struct {
 }
 
 // Write stores everything read from r, up to maxSize bytes (maxSize < 0
-// means unlimited). objectKey (see ObjectKey) determines placement. If
-// Write fails, shards already stored are left for garbage collection;
-// nothing references them.
+// means unlimited). objectKey (see ObjectKey) determines placement. Objects
+// whose declared size (maxSize) reaches the small-object threshold, or is
+// unknown, are erasure coded when the plane supports it; smaller ones are
+// replicated. If Write fails, shards already stored are left for garbage
+// collection; nothing references them.
 func (p *Plane) Write(ctx context.Context, r io.Reader, maxSize int64, objectKey string) (WriteResult, error) {
 	var res WriteResult
 	h := md5.New() // #nosec G401 -- computes the S3 ETag (MD5 by spec), not used for security
@@ -188,7 +260,13 @@ func (p *Plane) Write(ctx context.Context, r io.Reader, maxSize int64, objectKey
 		if maxSize >= 0 && res.Size+int64(n) > maxSize {
 			return res, ErrTooLarge
 		}
-		chunk, perr := p.putChunk(ctx, (*bp)[:n], PlacementKey(objectKey, idx))
+		var chunk metadata.Chunk
+		var perr error
+		if p.ec != nil && (maxSize < 0 || maxSize >= p.threshold) {
+			chunk, perr = p.putChunkEC(ctx, (*bp)[:n], PlacementKey(objectKey, idx))
+		} else {
+			chunk, perr = p.putChunk(ctx, (*bp)[:n], PlacementKey(objectKey, idx))
+		}
 		if perr != nil {
 			return res, fmt.Errorf("dataplane: store chunk %d: %w", idx, perr)
 		}
@@ -250,6 +328,99 @@ func (p *Plane) putChunk(ctx context.Context, data []byte, key string) (metadata
 	return chunk, nil
 }
 
+// putChunkEC erasure codes data into k+m shards and stores each on a
+// distinct node, shard i on the ring's i-th choice. Shards whose node fails
+// are retried on other nodes. The chunk is accepted once at least k+1
+// shards are stored (it still survives one more loss); shards that could
+// not be placed are recorded with an empty Node for repair to rebuild.
+func (p *Plane) putChunkEC(ctx context.Context, data []byte, key string) (metadata.Chunk, error) {
+	codec := p.ec
+	bp := p.ecBufs.Get().(*[]byte)
+	defer p.ecBufs.Put(bp)
+	shards, err := codec.Encode(data, *bp)
+	if err != nil {
+		return metadata.Chunk{}, err
+	}
+	refs := make([]metadata.ShardRef, codec.Total())
+	for i, sh := range shards {
+		refs[i] = metadata.ShardRef{Index: i, ID: storage.ShardID(sha256.Sum256(sh)), Size: int64(len(sh))}
+	}
+	tried := p.health.Down()
+	pending := make([]int, codec.Total())
+	for i := range pending {
+		pending[i] = i
+	}
+	var errs []error
+	for attempt := 0; attempt < 3 && len(pending) > 0; attempt++ {
+		exclude := slices.Clone(tried)
+		for _, r := range refs {
+			if r.Node != "" {
+				exclude = append(exclude, r.Node)
+			}
+		}
+		n := min(len(pending), p.eligible(exclude))
+		if n == 0 {
+			break
+		}
+		targets, err := p.ring.Pick(key, n, exclude...)
+		if err != nil {
+			errs = append(errs, err)
+			break
+		}
+		results := make([]error, n)
+		var wg sync.WaitGroup
+		for j, node := range targets {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				store, _ := p.Node(node)
+				_, results[j] = store.Put(ctx, bytesReader(shards[pending[j]]), refs[pending[j]].ID)
+			}()
+		}
+		wg.Wait()
+		var still []int
+		for j, node := range targets {
+			idx := pending[j]
+			tried = append(tried, node)
+			if results[j] != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", node, results[j]))
+				if errors.Is(results[j], storage.ErrUnavailable) {
+					p.health.MarkDown(node)
+				}
+				still = append(still, idx)
+				continue
+			}
+			refs[idx].Node = node
+		}
+		still = append(still, pending[n:]...)
+		pending = still
+		if err := ctx.Err(); err != nil {
+			return metadata.Chunk{}, err
+		}
+	}
+	placed := codec.Total() - len(pending)
+	if placed < codec.Data()+1 {
+		return metadata.Chunk{}, fmt.Errorf("%w: stored %d of %d shards (need %d): %w",
+			ErrInsufficientNodes, placed, codec.Total(), codec.Data()+1, errors.Join(errs...))
+	}
+	return metadata.Chunk{
+		Size:   int64(len(data)),
+		Scheme: metadata.Scheme{Data: codec.Data(), Parity: codec.Parity()},
+		Shards: refs,
+	}, nil
+}
+
+// eligible counts nodes on the ring that are not excluded.
+func (p *Plane) eligible(exclude []placement.NodeID) int {
+	n := 0
+	for _, id := range p.ring.Nodes() {
+		if !slices.Contains(exclude, id) {
+			n++
+		}
+	}
+	return n
+}
+
 // Read writes bytes [off, off+length) of obj to w. Each chunk is read and
 // verified in full before any of it is written, so a corrupt or missing
 // shard is replaced by another replica before its bytes are sent. An error
@@ -292,6 +463,14 @@ func (p *Plane) ReadChunk(ctx context.Context, c metadata.Chunk) (data []byte, r
 	release = func() { p.bufs.Put(bp) }
 	buf := (*bp)[:c.Size]
 
+	if !c.Scheme.IsReplication() {
+		if err := p.readEC(ctx, c, buf); err != nil {
+			release()
+			return nil, nil, err
+		}
+		return buf, release, nil
+	}
+
 	order := slices.Clone(c.Shards)
 	slices.SortStableFunc(order, func(a, b metadata.ShardRef) int {
 		da, db := p.health.IsDown(a.Node), p.health.IsDown(b.Node)
@@ -315,12 +494,85 @@ func (p *Plane) ReadChunk(ctx context.Context, c metadata.Chunk) (data []byte, r
 		return buf, release, nil
 	}
 	release()
-	return nil, nil, errors.Join(errs...)
+	return nil, nil, fmt.Errorf("%w: %w", ErrChunkUnavailable, errors.Join(errs...))
+}
+
+// readEC reads the k data shards of an erasure-coded chunk in parallel; if
+// any is missing, corrupt or unreachable, it reads the parity shards too and
+// reconstructs. Every shard is verified against its SHA-256 first, so a
+// corrupt shard is treated exactly like a missing one.
+func (p *Plane) readEC(ctx context.Context, c metadata.Chunk, out []byte) error {
+	codec, err := p.codec(c.Scheme)
+	if err != nil {
+		return err
+	}
+	total := codec.Total()
+	if len(c.Shards) != total {
+		return fmt.Errorf("%w: chunk has %d shard records, scheme needs %d", ErrChunkUnavailable, len(c.Shards), total)
+	}
+	size := int(c.Shards[0].Size)
+	var buf []byte
+	if bp, ok := p.ecBufs.Get().(*[]byte); ok && len(*bp) >= total*size {
+		defer p.ecBufs.Put(bp)
+		buf = *bp
+	} else {
+		if ok {
+			p.ecBufs.Put(bp)
+		}
+		buf = make([]byte, total*size)
+	}
+	refs := make([]metadata.ShardRef, total)
+	for _, r := range c.Shards {
+		if r.Index < 0 || r.Index >= total {
+			return fmt.Errorf("%w: shard index %d out of range", ErrChunkUnavailable, r.Index)
+		}
+		refs[r.Index] = r
+	}
+	shards := make([][]byte, total)
+	var mu sync.Mutex
+	var errs []error
+	fetch := func(indices []int) {
+		var wg sync.WaitGroup
+		for _, i := range indices {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				slot := buf[i*size : (i+1)*size : (i+1)*size]
+				if err := p.ReadShard(ctx, refs[i], slot); err != nil {
+					mu.Lock()
+					errs = append(errs, fmt.Errorf("shard %d on %q: %w", i, refs[i].Node, err))
+					mu.Unlock()
+					return
+				}
+				shards[i] = slot
+			}()
+		}
+		wg.Wait()
+	}
+	dataIdx := make([]int, codec.Data())
+	for i := range dataIdx {
+		dataIdx[i] = i
+	}
+	fetch(dataIdx)
+	if slices.ContainsFunc(shards[:codec.Data()], func(s []byte) bool { return s == nil }) {
+		parity := make([]int, codec.Parity())
+		for i := range parity {
+			parity[i] = codec.Data() + i
+		}
+		fetch(parity)
+		if err := codec.ReconstructData(shards); err != nil {
+			return fmt.Errorf("%w: %w: %w", ErrChunkUnavailable, err, errors.Join(errs...))
+		}
+	}
+	return codec.Join(out, shards, int(c.Size))
 }
 
 // ReadShard fills buf with shard ref from its node and confirms the shard
 // ends exactly there, which is when the checksum is verified.
 func (p *Plane) ReadShard(ctx context.Context, ref metadata.ShardRef, buf []byte) error {
+	if ref.Node == "" {
+		return fmt.Errorf("%w: shard not placed", storage.ErrNotFound)
+	}
 	store, ok := p.Node(ref.Node)
 	if !ok {
 		return fmt.Errorf("%w: unknown node %q", storage.ErrUnavailable, ref.Node)

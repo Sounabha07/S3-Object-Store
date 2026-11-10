@@ -63,6 +63,7 @@ fuzz:
 	$(GO) test -run=^$$ -fuzz=^FuzzListPagination$$ -fuzztime=$(FUZZTIME) ./internal/metadata/boltstore
 	$(GO) test -run=^$$ -fuzz=^FuzzChunkedReader$$ -fuzztime=$(FUZZTIME) ./internal/s3api
 	$(GO) test -run=^$$ -fuzz=^FuzzParseRange$$ -fuzztime=$(FUZZTIME) ./internal/s3api
+	$(GO) test -run=^$$ -fuzz=^FuzzRoundTrip$$ -fuzztime=$(FUZZTIME) ./internal/erasure
 
 smoke:
 	bash scripts/smoke.sh

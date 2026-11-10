@@ -8,6 +8,7 @@ import (
 
 	"github.com/Sounabha07/S3-Object-Store/internal/dataplane"
 	"github.com/Sounabha07/S3-Object-Store/internal/metadata"
+	"github.com/Sounabha07/S3-Object-Store/internal/storage"
 )
 
 // APIError is an S3 error response.
@@ -80,7 +81,9 @@ func toAPIError(err error) *APIError {
 		return ErrInvalidArgument
 	case errors.Is(err, metadata.ErrNotImplemented):
 		return ErrNotImplemented
-	case errors.Is(err, metadata.ErrUnavailable):
+	case errors.Is(err, metadata.ErrUnavailable),
+		errors.Is(err, storage.ErrUnavailable), // storage nodes down: possibly transient
+		errors.Is(err, dataplane.ErrInsufficientNodes):
 		return ErrServiceUnavailable
 	case errors.Is(err, dataplane.ErrTooLarge):
 		return ErrEntityTooLarge
