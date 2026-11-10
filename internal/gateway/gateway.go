@@ -45,7 +45,9 @@ type Config struct {
 	StorageNodes map[placement.NodeID]string
 	ChunkSize    int64
 	MinPartSize  int64 // 0: S3's 5 MiB
-	Log          *slog.Logger
+	// DisableErasure replicates every object 3x (used to compare schemes).
+	DisableErasure bool
+	Log            *slog.Logger
 	// HealthInterval is how often storage nodes are probed (0: 1s).
 	HealthInterval time.Duration
 
@@ -132,7 +134,7 @@ func New(cfg Config) (*Gateway, error) {
 		for id, url := range cfg.StorageNodes {
 			nodes[id] = storagenode.NewClient(url, hc)
 		}
-		p, err := dataplane.NewCluster(dataplane.Config{Nodes: nodes, ChunkSize: cfg.ChunkSize})
+		p, err := dataplane.NewCluster(dataplane.Config{Nodes: nodes, ChunkSize: cfg.ChunkSize, DisableErasure: cfg.DisableErasure})
 		if err != nil {
 			return fail(err)
 		}

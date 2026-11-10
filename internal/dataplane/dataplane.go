@@ -557,17 +557,37 @@ func (p *Plane) readEC(ctx context.Context, c metadata.Chunk, out []byte) error 
 		}
 		wg.Wait()
 	}
-	dataIdx := make([]int, codec.Data())
-	for i := range dataIdx {
-		dataIdx[i] = i
-	}
-	fetch(dataIdx)
-	if slices.ContainsFunc(shards[:codec.Data()], func(s []byte) bool { return s == nil }) {
-		parity := make([]int, codec.Parity())
-		for i := range parity {
-			parity[i] = codec.Data() + i
+	// Shards on nodes known to be down are not tried in the first rounds:
+	// waiting for a dead node's connect timeout would cost far more than
+	// reading a parity shard instead (measured: benchmark scenario 4).
+	down := func(i int) bool { return p.health.IsDown(refs[i].Node) }
+	var skipped []int
+	round := func(from, to int) {
+		var idx []int
+		for i := from; i < to; i++ {
+			if down(i) {
+				skipped = append(skipped, i)
+				continue
+			}
+			idx = append(idx, i)
 		}
-		fetch(parity)
+		fetch(idx)
+	}
+	have := func() int {
+		n := 0
+		for _, s := range shards {
+			if s != nil {
+				n++
+			}
+		}
+		return n
+	}
+	round(0, codec.Data())
+	if have() < codec.Data() || slices.ContainsFunc(shards[:codec.Data()], func(s []byte) bool { return s == nil }) {
+		round(codec.Data(), total)
+		if have() < codec.Data() && len(skipped) > 0 {
+			fetch(skipped) // last resort: the health view may be stale
+		}
 		if err := codec.ReconstructData(shards); err != nil {
 			return fmt.Errorf("%w: %w: %w", ErrChunkUnavailable, err, errors.Join(errs...))
 		}

@@ -76,6 +76,19 @@ func (c *Client) setLeader(endpoint string) {
 	c.leader.Store(&endpoint)
 }
 
+// after returns the endpoint following target, so a failed node is not
+// retried immediately. (Choosing by attempt number could pick the same dead
+// node twice in a row; benchmark scenario 6 measured that as a ~7.7 s write
+// stall after a leader kill.)
+func (c *Client) after(target string) string {
+	for i, e := range c.endpoints {
+		if e == target {
+			return c.endpoints[(i+1)%len(c.endpoints)]
+		}
+	}
+	return c.endpoints[0] // target came from a leader hint, not our list
+}
+
 func (c *Client) forget(endpoint string) {
 	if l := c.leader.Load(); l != nil && *l == endpoint {
 		c.leader.CompareAndSwap(l, nil)
@@ -149,7 +162,7 @@ func (c *Client) call(ctx context.Context, method, path string, q url.Values, bo
 			uncertain = uncertain || isWrite
 			lastErr = fmt.Errorf("%s: %w", target, err)
 			c.forget(target)
-			target = c.endpoints[(attempt+1)%len(c.endpoints)]
+			target = c.after(target)
 			wait()
 			continue
 		}
@@ -177,7 +190,7 @@ func (c *Client) call(ctx context.Context, method, path string, q url.Values, bo
 				}
 				continue
 			}
-			target = c.endpoints[(attempt+1)%len(c.endpoints)]
+			target = c.after(target)
 			wait()
 		case codeOutcomeUnknown:
 			uncertain = true

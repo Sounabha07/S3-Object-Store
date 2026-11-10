@@ -2,10 +2,15 @@ package dataplane
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Sounabha07/S3-Object-Store/internal/metadata"
 	"github.com/Sounabha07/S3-Object-Store/internal/placement"
@@ -228,5 +233,52 @@ func TestStorageOverhead(t *testing.T) {
 	rep.write(t, storagetest.RandomBytes(t, int(logical)), "b/rep/v")
 	if got := float64(diskBytes(t, rep)) / float64(logical); got != 3 {
 		t.Fatalf("3x replication overhead %.3f, want 3", got)
+	}
+}
+
+// slowNode answers nothing for a while before failing, like a stopped
+// container whose address still resolves (connect timeout).
+type slowNode struct {
+	*switchable
+	delay time.Duration
+	calls atomic.Int64
+}
+
+func (s *slowNode) Get(ctx context.Context, id storage.ShardID) (io.ReadCloser, error) {
+	s.calls.Add(1)
+	select {
+	case <-time.After(s.delay):
+	case <-ctx.Done():
+	}
+	return nil, fmt.Errorf("%w: connect timeout", storage.ErrUnavailable)
+}
+
+// TestDegradedReadSkipsKnownDownNodes: once a node is known to be down,
+// erasure-coded reads go straight to parity instead of waiting for it.
+// Benchmark scenario 4 found the earlier code paid the full connect timeout
+// on every read (2.5 s median with 2 of 6 nodes down).
+func TestDegradedReadSkipsKnownDownNodes(t *testing.T) {
+	tc := newECCluster(t)
+	data := storagetest.RandomBytes(t, ecChunk)
+	obj := tc.writeSized(t, data, "b/k/v")
+	slow := map[placement.NodeID]*slowNode{}
+	for _, i := range []int{0, 2} { // two data shards' nodes
+		id := obj.Chunks[0].Shards[i].Node
+		slow[id] = &slowNode{switchable: tc.nodes[id], delay: 2 * time.Second}
+		tc.plane.AddNode(id, slow[id]) // replace the store behind the ID
+		tc.plane.Health().MarkDown(id)
+	}
+	start := time.Now()
+	got, err := tc.readAll(obj)
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("degraded read: %v", err)
+	}
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Fatalf("degraded read took %v; known-down nodes were waited on", d)
+	}
+	for id, s := range slow {
+		if s.calls.Load() != 0 {
+			t.Fatalf("down node %s was contacted %d times", id, s.calls.Load())
+		}
 	}
 }

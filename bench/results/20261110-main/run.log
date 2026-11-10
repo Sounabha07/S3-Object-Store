@@ -1,0 +1,77 @@
+[10:39:35] === s1
+[10:39:47] s1 put 4KiB run 1
+[10:40:05] s1 get 4KiB run 1
+[10:40:21] s1 put 4KiB run 2
+[10:40:37] s1 get 4KiB run 2
+[10:40:53] s1 put 4KiB run 3
+[10:41:08] s1 get 4KiB run 3
+[10:41:41] s1 put 1MiB run 1
+[10:41:57] s1 get 1MiB run 1
+[10:42:13] s1 put 1MiB run 2
+[10:42:29] s1 get 1MiB run 2
+[10:42:46] s1 put 1MiB run 3
+[10:43:01] s1 get 1MiB run 3
+[10:43:40] s1 put 64MiB run 1
+[10:43:59] s1 get 64MiB run 1
+[10:44:20] s1 put 64MiB run 2
+[10:44:42] s1 get 64MiB run 2
+[10:45:04] s1 put 64MiB run 3
+[10:45:22] s1 get 64MiB run 3
+[10:45:54] === s2
+[10:46:33] s2 put c1 run 1
+[10:46:49] s2 get c1 run 1
+[10:47:05] s2 put c1 run 2
+[10:47:21] s2 get c1 run 2
+[10:47:37] s2 put c1 run 3
+[10:47:52] s2 get c1 run 3
+[10:48:09] s2 put c8 run 1
+[10:48:24] s2 get c8 run 1
+[10:48:41] s2 put c8 run 2
+[10:48:56] s2 get c8 run 2
+[10:49:12] s2 put c8 run 3
+[10:49:28] s2 get c8 run 3
+[10:49:46] s2 put c32 run 1
+[10:50:04] s2 get c32 run 1
+[10:50:22] s2 put c32 run 2
+[10:50:38] s2 get c32 run 2
+[10:50:57] s2 put c32 run 3
+[10:51:14] s2 get c32 run 3
+[10:51:33] s2 put c128 run 1
+[10:51:53] s2 get c128 run 1
+[10:52:26] s2 put c128 run 2
+[10:52:44] s2 get c128 run 2
+[10:53:16] s2 put c128 run 3
+[10:53:33] s2 get c128 run 3
+[10:54:02] === s3
+[10:54:55] s3 mixed run 1
+[10:55:32] s3 mixed run 2
+[10:56:08] s3 mixed run 3
+[10:56:49] === s4
+[10:57:22] s4 healthy run 1
+[10:57:42] s4 degraded run 1
+[10:58:26] s4 healthy run 2
+[10:58:46] s4 degraded run 2
+[10:59:29] s4 healthy run 3
+[10:59:49] s4 degraded run 3
+[11:00:07] === s5
+[11:00:22] s5 write run 1
+[11:00:53] s5 repair run 1 (storage-3 held 536870912 bytes)
+[11:01:27] s5 write run 2
+[11:01:58] s5 repair run 2 (storage-3 held 536870912 bytes)
+[11:02:32] s5 write run 3
+[11:03:09] s5 repair run 3 (storage-3 held 536870912 bytes)
+[11:03:28] === s6
+[11:03:46] s6 run 1
+[11:04:29] s6 run 1: {"max_gap_between_successes_ms": 7715.7, "median_gap_before_fault_ms": 12.55, "failed_ops_after_fault": 0}
+[11:04:45] s6 run 2
+[11:05:27] s6 run 2: {"max_gap_between_successes_ms": 7165.1, "median_gap_before_fault_ms": 10.70, "failed_ops_after_fault": 0}
+[11:05:43] s6 run 3
+[11:06:25] s6 run 3: {"max_gap_between_successes_ms": 7696.4, "median_gap_before_fault_ms": 10.77, "failed_ops_after_fault": 0}
+[11:06:25] === s7
+[11:06:41] s7 ec run 1
+[11:07:14] s7 ec run 2
+[11:07:50] s7 ec run 3
+[11:08:26] s7 replication run 1
+[11:09:18] s7 replication run 2
+[11:10:06] s7 replication run 3
+[11:10:34] results in bench/results/20261110-main
