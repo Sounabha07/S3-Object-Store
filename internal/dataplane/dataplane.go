@@ -79,6 +79,10 @@ type Plane struct {
 	replicas  int
 	bufs      sync.Pool // *[]byte of len chunkSize
 
+	// onReadFailure, if set, is told about every failed shard read (used
+	// for the storage_shard_read_failures_total metric).
+	onReadFailure func(node placement.NodeID, err error)
+
 	ec        *erasure.Codec // nil: replicate everything
 	threshold int64
 	ecBufs    sync.Pool // *[]byte holding all shards of one default-scheme chunk
@@ -154,6 +158,10 @@ func (p *Plane) codec(scheme metadata.Scheme) (*erasure.Codec, error) {
 	p.codecs.Store(scheme, c)
 	return c, nil
 }
+
+// OnReadFailure registers a callback for failed shard reads. Call it before
+// the plane is used.
+func (p *Plane) OnReadFailure(fn func(node placement.NodeID, err error)) { p.onReadFailure = fn }
 
 // Codec returns the codec for an erasure-coding scheme (used by repair).
 func (p *Plane) Codec(scheme metadata.Scheme) (*erasure.Codec, error) { return p.codec(scheme) }
@@ -570,6 +578,14 @@ func (p *Plane) readEC(ctx context.Context, c metadata.Chunk, out []byte) error 
 // ReadShard fills buf with shard ref from its node and confirms the shard
 // ends exactly there, which is when the checksum is verified.
 func (p *Plane) ReadShard(ctx context.Context, ref metadata.ShardRef, buf []byte) error {
+	err := p.readShard(ctx, ref, buf)
+	if err != nil && p.onReadFailure != nil && ctx.Err() == nil {
+		p.onReadFailure(ref.Node, err)
+	}
+	return err
+}
+
+func (p *Plane) readShard(ctx context.Context, ref metadata.ShardRef, buf []byte) error {
 	if ref.Node == "" {
 		return fmt.Errorf("%w: shard not placed", storage.ErrNotFound)
 	}

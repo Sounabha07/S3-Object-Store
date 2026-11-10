@@ -8,6 +8,7 @@ import (
 	"log/slog"
 
 	"github.com/Sounabha07/S3-Object-Store/internal/httpserv"
+	"github.com/Sounabha07/S3-Object-Store/internal/metrics"
 	"github.com/Sounabha07/S3-Object-Store/internal/storage/disk"
 	"github.com/Sounabha07/S3-Object-Store/internal/storagenode"
 )
@@ -26,7 +27,11 @@ func main() {
 			}
 			log = log.With("node", *nodeID)
 			log.Info("starting", "data", *dataDir)
-			return httpserv.Setup{Handler: storagenode.Handler(d, log), Health: d.Health, Close: d.Close}, nil
+			reg := metrics.NewProcess()
+			return httpserv.Setup{
+				Handler: metrics.InstrumentHTTP(reg, "storagenode", storagenode.Handler(d, log)),
+				Health:  d.Health, Close: d.Close, Metrics: metrics.Handler(reg),
+			}, nil
 		},
 	})
 }

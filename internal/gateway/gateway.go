@@ -5,6 +5,7 @@ package gateway
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,10 +22,12 @@ import (
 	"github.com/Sounabha07/S3-Object-Store/internal/metadata"
 	"github.com/Sounabha07/S3-Object-Store/internal/metadata/boltstore"
 	"github.com/Sounabha07/S3-Object-Store/internal/metadata/raftmeta"
+	"github.com/Sounabha07/S3-Object-Store/internal/metrics"
 	"github.com/Sounabha07/S3-Object-Store/internal/placement"
 	"github.com/Sounabha07/S3-Object-Store/internal/rebalance"
 	"github.com/Sounabha07/S3-Object-Store/internal/repair"
 	"github.com/Sounabha07/S3-Object-Store/internal/s3api"
+	"github.com/Sounabha07/S3-Object-Store/internal/sigv4"
 	"github.com/Sounabha07/S3-Object-Store/internal/storage"
 	"github.com/Sounabha07/S3-Object-Store/internal/storage/disk"
 	"github.com/Sounabha07/S3-Object-Store/internal/storagenode"
@@ -52,10 +55,19 @@ type Config struct {
 	DeepRepair     bool // verify shard contents, not just presence
 	GCInterval     time.Duration
 	GCGrace        time.Duration // 0: gc.DefaultGrace
+
+	// Credentials maps S3 access key IDs to secrets. When non-empty every
+	// S3 request must be SigV4-signed with one of them; when empty the
+	// gateway accepts anonymous requests (development only).
+	Credentials map[string]string
+	// AdminToken authorises /_admin/ requests (Authorization: Bearer
+	// <token>). With Credentials set and no token, /_admin/ is disabled.
+	AdminToken string
 }
 
 // Gateway is an assembled gateway.
 type Gateway struct {
+	Metrics  *metrics.Gateway
 	Meta     metadata.Metadata
 	Plane    *dataplane.Plane
 	Repairer *repair.Repairer
@@ -141,8 +153,19 @@ func New(cfg Config) (*Gateway, error) {
 		g.Health = d.Health
 	}
 
-	s3 := s3api.New(s3api.Config{Meta: g.Meta, Data: g.Plane, Log: log, MinPartSize: cfg.MinPartSize})
-	admin := g.adminHandler(log)
+	g.Metrics = metrics.NewGateway()
+	g.Plane.OnReadFailure(func(node placement.NodeID, err error) {
+		g.Metrics.ShardReadFailures.WithLabelValues(string(node), metrics.ShardFailureReason(err)).Inc()
+	})
+	metrics.Gauge(g.Metrics.Registry, "storage_nodes_down", "Storage nodes currently considered down.",
+		func() float64 { return float64(len(g.Plane.Health().Down())) })
+
+	var auth *sigv4.Verifier
+	if len(cfg.Credentials) > 0 {
+		auth = &sigv4.Verifier{Credentials: cfg.Credentials}
+	}
+	s3 := s3api.New(s3api.Config{Meta: g.Meta, Data: g.Plane, Log: log, MinPartSize: cfg.MinPartSize, Auth: auth, Metrics: g.Metrics})
+	admin := adminAuth(g.adminHandler(log), len(cfg.Credentials) > 0, cfg.AdminToken)
 	g.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// "_admin" can never be a valid bucket name, so this cannot shadow S3.
 		if strings.HasPrefix(r.URL.Path, "/_admin/") {
@@ -152,6 +175,8 @@ func New(cfg Config) (*Gateway, error) {
 		s3.ServeHTTP(w, r)
 	})
 	g.Repairer = &repair.Repairer{Meta: g.Meta, Plane: g.Plane, Log: log, Deep: cfg.DeepRepair}
+	metrics.Gauge(g.Metrics.Registry, "repair_queue_depth", "Degraded chunks waiting in the current repair pass.",
+		func() float64 { return float64(g.Repairer.QueueDepth()) })
 	g.GC = &gc.Collector{Meta: g.Meta, Plane: g.Plane, Grace: cfg.GCGrace, Log: log}
 	if cfg.RepairInterval > 0 {
 		go every(ctx, cfg.RepairInterval, func() {
@@ -188,13 +213,58 @@ func every(ctx context.Context, interval time.Duration, fn func()) {
 func (g *Gateway) runRepair(ctx context.Context) (repair.Stats, error) {
 	g.repairMu.Lock()
 	defer g.repairMu.Unlock()
-	return g.Repairer.Run(ctx)
+	st, err := g.Repairer.Run(ctx)
+	g.Metrics.RepairShards.Add(float64(st.ShardsRebuilt))
+	g.Metrics.RepairUnrecover.Add(float64(st.Unrecoverable))
+	if err == nil {
+		g.Metrics.RepairPasses.Inc()
+	}
+	return st, err
 }
 
 func (g *Gateway) runGC(ctx context.Context) (gc.Stats, error) {
 	g.gcMu.Lock()
 	defer g.gcMu.Unlock()
-	return g.GC.Run(ctx)
+	st, err := g.GC.Run(ctx)
+	g.Metrics.GCDeleted.Add(float64(st.Deleted))
+	g.Metrics.GCBytesFreed.Add(float64(st.BytesFreed))
+	return st, err
+}
+
+// MetricsHandler serves the gateway's Prometheus metrics.
+func (g *Gateway) MetricsHandler() http.Handler { return metrics.Handler(g.Metrics.Registry) }
+
+// adminAuth protects the admin API. Without S3 credentials (development
+// mode) it is open, like the S3 API. With credentials it needs the admin
+// bearer token, and is disabled if no token is configured.
+func adminAuth(next http.Handler, authEnabled bool, token string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if authEnabled {
+			got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+			if token == "" || !ok || subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+				http.Error(w, "admin API requires a valid bearer token", http.StatusForbidden)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ParseCredentials parses "accesskey:secret,accesskey:secret".
+func ParseCredentials(s string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, item := range strings.Split(s, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(item, ":")
+		if !ok || k == "" || v == "" {
+			return nil, fmt.Errorf("gateway: bad credential %q, want accesskey:secret", "<redacted>")
+		}
+		out[k] = v
+	}
+	return out, nil
 }
 
 // Close releases local resources and stops background work.

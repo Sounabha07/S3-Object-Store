@@ -89,6 +89,7 @@ func (s *Server) routeMultipart(w http.ResponseWriter, r *http.Request, req *req
 }
 
 func (s *Server) createMultipart(w http.ResponseWriter, r *http.Request, req *request) {
+	req.op = "CreateMultipartUpload"
 	userMeta, apiErr := parseUserMeta(r.Header)
 	if apiErr != nil {
 		s.writeError(w, r, req, apiErr)
@@ -122,6 +123,7 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request, req *request, up
 }
 
 func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, req *request, uploadID, partNumber string) {
+	req.op = "UploadPart"
 	n, err := strconv.Atoi(partNumber)
 	if err != nil || n < 1 || n > metadata.MaxPartNumber {
 		s.writeError(w, r, req, ErrInvalidArgument.withMessage("Part number must be an integer between 1 and 10000, inclusive."))
@@ -156,6 +158,7 @@ func (s *Server) uploadPart(w http.ResponseWriter, r *http.Request, req *request
 }
 
 func (s *Server) completeMultipart(w http.ResponseWriter, r *http.Request, req *request, uploadID string) {
+	req.op = "CompleteMultipartUpload"
 	if _, ok := s.upload(w, r, req, uploadID); !ok {
 		return
 	}
@@ -192,6 +195,7 @@ func (s *Server) completeMultipart(w http.ResponseWriter, r *http.Request, req *
 }
 
 func (s *Server) abortMultipart(w http.ResponseWriter, r *http.Request, req *request, uploadID string) {
+	req.op = "AbortMultipartUpload"
 	if _, ok := s.upload(w, r, req, uploadID); !ok {
 		return
 	}
@@ -203,6 +207,7 @@ func (s *Server) abortMultipart(w http.ResponseWriter, r *http.Request, req *req
 }
 
 func (s *Server) listParts(w http.ResponseWriter, r *http.Request, req *request, uploadID string) {
+	req.op = "ListParts"
 	if _, ok := s.upload(w, r, req, uploadID); !ok {
 		return
 	}

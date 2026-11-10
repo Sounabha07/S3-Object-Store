@@ -28,7 +28,13 @@ type Setup struct {
 	Health HealthFunc
 	// Close is called after the server has shut down.
 	Close func() error
+	// Metrics, if set, is served at MetricsPath.
+	Metrics http.Handler
 }
+
+// MetricsPath serves Prometheus metrics. Like HealthPath it cannot be a
+// bucket name.
+const MetricsPath = "/_metrics"
 
 // Service describes one binary for Main.
 type Service struct {
@@ -43,6 +49,7 @@ type Service struct {
 func Main(s Service) {
 	listen := flag.String("listen", s.DefaultAddr, "address to listen on")
 	probe := flag.String("probe", "", "GET this URL, exit 0 if it returns 200 (container health check)")
+	logLevel := flag.String("log-level", "info", "log level: debug, info, warn or error")
 	flag.Parse()
 
 	if *probe != "" {
@@ -55,7 +62,12 @@ func Main(s Service) {
 		os.Exit(0)
 	}
 
-	log := slog.New(slog.NewJSONHandler(os.Stderr, nil)).With("service", s.Name)
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(*logLevel)); err != nil {
+		fmt.Fprintln(os.Stderr, "bad -log-level:", err)
+		os.Exit(2)
+	}
+	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level})).With("service", s.Name)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ln, err := net.Listen("tcp", *listen)
@@ -71,9 +83,16 @@ func Main(s Service) {
 
 // Root returns the top-level handler: HealthPath goes to the health check,
 // everything else to h (404 if h is nil).
-func Root(h http.Handler, health HealthFunc) http.Handler {
+func Root(h http.Handler, health HealthFunc) http.Handler { return RootWithMetrics(h, health, nil) }
+
+// RootWithMetrics is Root that also serves metrics at MetricsPath.
+func RootWithMetrics(h http.Handler, health HealthFunc, metrics http.Handler) http.Handler {
 	hh := HealthHandler(health)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if metrics != nil && r.URL.Path == MetricsPath {
+			metrics.ServeHTTP(w, r)
+			return
+		}
 		if r.URL.Path == HealthPath {
 			hh.ServeHTTP(w, r)
 			return
@@ -97,6 +116,6 @@ func run(ctx context.Context, s Service, ln net.Listener, log *slog.Logger) (err
 	if setup.Close != nil {
 		defer func() { err = errors.Join(err, setup.Close()) }()
 	}
-	srv := &http.Server{Handler: Root(setup.Handler, setup.Health), ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Handler: RootWithMetrics(setup.Handler, setup.Health, setup.Metrics), ReadHeaderTimeout: 10 * time.Second}
 	return Serve(ctx, srv, ln, 10*time.Second, log)
 }

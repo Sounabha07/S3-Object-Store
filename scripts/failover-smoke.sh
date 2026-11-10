@@ -20,7 +20,7 @@ done
 
 echo "--- meta-1 and meta-2 stopped (no quorum)"
 $DC stop meta-1 meta-2 >/dev/null
-code="$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$EP/noquorum-$RANDOM")"
+code="$(curl --aws-sigv4 "aws:amz:us-east-1:s3" --user "${AWS_ACCESS_KEY_ID:-test-access-key}:${AWS_SECRET_ACCESS_KEY:-test-secret-key}"   -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" -s -o /dev/null -w '%{http_code}' -X PUT "$EP/noquorum-$RANDOM")"
 $DC start meta-1 meta-2 >/dev/null
 if [ "$code" != 503 ]; then
   echo "FAIL: write without quorum returned HTTP $code, want 503" >&2
