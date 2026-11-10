@@ -23,6 +23,8 @@ var (
 	ErrInvalidPartOrder      = errors.New("metadata: invalid part order")
 	ErrNotLeader             = errors.New("metadata: not the raft leader")
 	ErrShardLocationConflict = errors.New("metadata: shard location changed concurrently")
+	ErrInvalidArgument       = errors.New("metadata: invalid argument")
+	ErrNotImplemented        = errors.New("metadata: not implemented")
 )
 
 // Scheme is the redundancy scheme of a chunk.
@@ -33,7 +35,9 @@ type Scheme struct {
 }
 
 // Replication3 and EC42 are the two schemes the system writes by default.
+// Single (one copy, no redundancy) is used only by the single-node mode.
 var (
+	Single       = Scheme{Data: 1, Parity: 0}
 	Replication3 = Scheme{Data: 1, Parity: 2}
 	EC42         = Scheme{Data: 4, Parity: 2}
 )
@@ -69,6 +73,7 @@ type ObjectMeta struct {
 	ETag         string // quoted S3 ETag
 	ContentType  string
 	UserMeta     map[string]string // x-amz-meta-* headers, lowercased keys
+	Headers      map[string]string // stored system headers (Cache-Control, Content-Encoding, ...), canonical names
 	LastModified time.Time
 	Chunks       []Chunk
 }

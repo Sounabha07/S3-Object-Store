@@ -12,6 +12,8 @@ import (
 	"time"
 )
 
+var discard = slog.New(slog.DiscardHandler)
+
 func TestHealthHandler(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -25,7 +27,7 @@ func TestHealthHandler(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			rec := httptest.NewRecorder()
-			HealthHandler(c.check).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+			HealthHandler(c.check).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, HealthPath, nil))
 			if rec.Code != c.want {
 				t.Fatalf("status = %d, want %d", rec.Code, c.want)
 			}
@@ -46,6 +48,33 @@ func TestProbe(t *testing.T) {
 	if err := Probe(ctx, bad.URL); err == nil {
 		t.Fatal("Probe(unhealthy) = nil, want error")
 	}
+	if err := Probe(ctx, "http://127.0.0.1:1/unreachable"); err == nil {
+		t.Fatal("Probe(unreachable) = nil, want error")
+	}
+}
+
+func TestRootRouting(t *testing.T) {
+	app := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "app:"+r.URL.Path) })
+	cases := []struct {
+		handler  http.Handler
+		path     string
+		wantCode int
+		wantBody string
+	}{
+		{app, HealthPath, http.StatusOK, "ok\n"},
+		{app, "/bucket/a//b/../c", http.StatusOK, "app:/bucket/a//b/../c"}, // not cleaned or redirected
+		{app, "/healthz", http.StatusOK, "app:/healthz"},                   // a legal bucket name
+		{nil, "/anything", http.StatusNotFound, ""},
+	}
+	for _, c := range cases {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.URL.Path = c.path
+		Root(c.handler, nil).ServeHTTP(rec, req)
+		if rec.Code != c.wantCode || (c.wantBody != "" && rec.Body.String() != c.wantBody) {
+			t.Errorf("%s: got %d %q, want %d %q", c.path, rec.Code, rec.Body.String(), c.wantCode, c.wantBody)
+		}
+	}
 }
 
 func TestServeGracefulShutdown(t *testing.T) {
@@ -53,15 +82,13 @@ func TestServeGracefulShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := http.NewServeMux()
-	mux.Handle("/healthz", HealthHandler(nil))
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: time.Second}
+	srv := &http.Server{Handler: Root(nil, nil), ReadHeaderTimeout: time.Second}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- Serve(ctx, srv, ln, 5*time.Second, slog.New(slog.NewTextHandler(io.Discard, nil))) }()
+	go func() { done <- Serve(ctx, srv, ln, 5*time.Second, discard) }()
 
-	if err := Probe(context.Background(), "http://"+ln.Addr().String()+"/healthz"); err != nil {
+	if err := Probe(context.Background(), "http://"+ln.Addr().String()+HealthPath); err != nil {
 		t.Fatalf("probe before shutdown: %v", err)
 	}
 	cancel()
@@ -75,44 +102,53 @@ func TestServeGracefulShutdown(t *testing.T) {
 	}
 }
 
-func TestRunServesSetupRoutesAndHealth(t *testing.T) {
+func TestRunServesSetupHandlerHealthAndClose(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	healthy := make(chan struct{})
+	closed := make(chan struct{})
 	svc := Service{
 		Name: "test",
-		Setup: func(ctx context.Context, mux *http.ServeMux, log *slog.Logger) (HealthFunc, error) {
-			mux.HandleFunc("GET /hello", func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "hi") })
-			return func(context.Context) error {
-				select {
-				case <-healthy:
-					return nil
-				default:
-					return errors.New("starting")
-				}
+		Setup: func(ctx context.Context, log *slog.Logger) (Setup, error) {
+			return Setup{
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "hi") }),
+				Health: func(context.Context) error {
+					select {
+					case <-healthy:
+						return nil
+					default:
+						return errors.New("starting")
+					}
+				},
+				Close: func() error { close(closed); return nil },
 			}, nil
 		},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- run(ctx, svc, ln, slog.New(slog.NewTextHandler(io.Discard, nil))) }()
+	go func() { done <- run(ctx, svc, ln, discard) }()
 
 	base := "http://" + ln.Addr().String()
-	if err := Probe(context.Background(), base+"/healthz"); err == nil {
-		t.Fatal("healthz succeeded before service reported healthy")
+	if err := Probe(context.Background(), base+HealthPath); err == nil {
+		t.Fatal("health succeeded before service reported healthy")
 	}
 	close(healthy)
-	if err := Probe(context.Background(), base+"/healthz"); err != nil {
-		t.Fatalf("healthz after healthy: %v", err)
+	if err := Probe(context.Background(), base+HealthPath); err != nil {
+		t.Fatalf("health after healthy: %v", err)
 	}
 	if err := Probe(context.Background(), base+"/hello"); err != nil {
-		t.Fatalf("setup route: %v", err)
+		t.Fatalf("setup handler: %v", err)
 	}
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("run returned %v", err)
+	}
+	select {
+	case <-closed:
+	default:
+		t.Fatal("Close was not called on shutdown")
 	}
 }
 
@@ -121,11 +157,10 @@ func TestRunSetupError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
-	svc := Service{Setup: func(context.Context, *http.ServeMux, *slog.Logger) (HealthFunc, error) {
-		return nil, errors.New("boom")
+	svc := Service{Setup: func(context.Context, *slog.Logger) (Setup, error) {
+		return Setup{}, errors.New("boom")
 	}}
-	if err := run(context.Background(), svc, ln, slog.New(slog.NewTextHandler(io.Discard, nil))); err == nil {
+	if err := run(context.Background(), svc, ln, discard); err == nil {
 		t.Fatal("run with failing setup returned nil")
 	}
 }

@@ -1,17 +1,16 @@
 // Command storage runs a storage node holding immutable, content-addressed shards.
 //
-// M0: serves /healthz only. The shard API arrives in M3.
+// M1: serves the health endpoint backed by the local disk store. The
+// internal shard API arrives in M3.
 package main
 
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log/slog"
-	"net/http"
-	"os"
 
 	"github.com/Sounabha07/S3-Object-Store/internal/httpserv"
+	"github.com/Sounabha07/S3-Object-Store/internal/storage/disk"
 )
 
 func main() {
@@ -21,12 +20,13 @@ func main() {
 	httpserv.Main(httpserv.Service{
 		Name:        "storage",
 		DefaultAddr: ":8000",
-		Setup: func(ctx context.Context, mux *http.ServeMux, log *slog.Logger) (httpserv.HealthFunc, error) {
-			if err := os.MkdirAll(*dataDir, 0o755); err != nil {
-				return nil, fmt.Errorf("create data dir: %w", err)
+		Setup: func(ctx context.Context, log *slog.Logger) (httpserv.Setup, error) {
+			d, err := disk.Open(*dataDir)
+			if err != nil {
+				return httpserv.Setup{}, err
 			}
 			log.Info("starting", "id", *nodeID, "data", *dataDir)
-			return nil, nil
+			return httpserv.Setup{Health: d.Health, Close: d.Close}, nil
 		},
 	})
 }

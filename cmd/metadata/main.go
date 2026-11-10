@@ -1,6 +1,7 @@
 // Command metadata runs one member of the Raft metadata cluster.
 //
-// M0: serves /healthz only. Raft and BoltDB arrive in M2.
+// M1: serves the health endpoint only. Raft arrives in M2; until then the
+// gateway embeds its own BoltDB metadata store.
 package main
 
 import (
@@ -8,7 +9,6 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 
 	"github.com/Sounabha07/S3-Object-Store/internal/httpserv"
@@ -21,12 +21,12 @@ func main() {
 	httpserv.Main(httpserv.Service{
 		Name:        "metadata",
 		DefaultAddr: ":7000",
-		Setup: func(ctx context.Context, mux *http.ServeMux, log *slog.Logger) (httpserv.HealthFunc, error) {
-			if err := os.MkdirAll(*dataDir, 0o755); err != nil {
-				return nil, fmt.Errorf("create data dir: %w", err)
+		Setup: func(ctx context.Context, log *slog.Logger) (httpserv.Setup, error) {
+			if err := os.MkdirAll(*dataDir, 0o750); err != nil {
+				return httpserv.Setup{}, fmt.Errorf("create data dir: %w", err)
 			}
 			log.Info("starting", "id", *nodeID, "data", *dataDir)
-			return nil, nil
+			return httpserv.Setup{}, nil
 		},
 	})
 }
