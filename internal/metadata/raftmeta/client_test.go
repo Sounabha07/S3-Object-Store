@@ -300,3 +300,42 @@ func TestClientSkipsUnresponsiveNode(t *testing.T) {
 		t.Fatalf("took %v; the unresponsive node was not abandoned after AttemptTimeout", d)
 	}
 }
+
+// TestClientDoesNotRetryDeadNodeImmediately: when the cached leader stops
+// answering, the next attempt goes to a different node. The old rotation
+// (by attempt number) could hit the same dead node twice, doubling the
+// stall after a leader crash.
+func TestClientDoesNotRetryDeadNodeImmediately(t *testing.T) {
+	_, a := newFakeLeader(t)
+	_, c2 := newFakeLeader(t)
+	hole, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hole.Close()
+	var accepted atomic.Int64
+	go func() {
+		for {
+			conn, err := hole.Accept()
+			if err != nil {
+				return
+			}
+			accepted.Add(1)
+			defer conn.Close()
+		}
+	}()
+	dead := "http://" + hole.Addr().String()
+	cl := NewClient([]string{a.URL, dead, c2.URL}, nil)
+	cl.AttemptTimeout = 300 * time.Millisecond
+	cl.setLeader(dead) // the leader we knew about just crashed
+	start := time.Now()
+	if _, err := cl.ListBuckets(bg); err != nil {
+		t.Fatal(err)
+	}
+	if n := accepted.Load(); n != 1 {
+		t.Fatalf("dead node contacted %d times, want 1", n)
+	}
+	if d := time.Since(start); d > 550*time.Millisecond {
+		t.Fatalf("took %v; expected one attempt timeout plus a fast retry", d)
+	}
+}
