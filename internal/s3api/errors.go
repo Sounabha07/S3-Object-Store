@@ -48,6 +48,7 @@ var (
 	ErrNoSuchKey               = &APIError{"NoSuchKey", "The specified key does not exist.", http.StatusNotFound}
 	ErrNotImplemented          = &APIError{"NotImplemented", "A header or query you provided implies functionality that is not implemented.", http.StatusNotImplemented}
 	ErrPreconditionFailed      = &APIError{"PreconditionFailed", "At least one of the pre-conditions you specified did not hold", http.StatusPreconditionFailed}
+	ErrServiceUnavailable      = &APIError{"ServiceUnavailable", "Please reduce your request rate.", http.StatusServiceUnavailable}
 	ErrSHA256Mismatch          = &APIError{"XAmzContentSHA256Mismatch", "The provided 'x-amz-content-sha256' header does not match what was computed.", http.StatusBadRequest}
 )
 
@@ -79,6 +80,8 @@ func toAPIError(err error) *APIError {
 		return ErrInvalidArgument
 	case errors.Is(err, metadata.ErrNotImplemented):
 		return ErrNotImplemented
+	case errors.Is(err, metadata.ErrUnavailable):
+		return ErrServiceUnavailable
 	case errors.Is(err, dataplane.ErrTooLarge):
 		return ErrEntityTooLarge
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):

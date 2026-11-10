@@ -1,21 +1,36 @@
 // Package boltstore implements metadata.Metadata on a local BoltDB file.
 //
-// In M1 it is the gateway's metadata backend directly; in M2 it becomes the
-// state machine store underneath Raft.
+// It is used two ways:
+//
+//   - directly, as the gateway's metadata backend in single-node mode;
+//   - as the state machine store underneath Raft (internal/metadata/raftmeta).
+//
+// Every mutation is expressed as a Command and applied through Apply, so the
+// single-node path and the Raft path execute identical code. Apply is
+// deterministic: its outcome depends only on the current state and the
+// command (timestamps travel inside the command), which is what Raft
+// requires of a state machine.
 //
 // Bolt layout:
 //
 //	buckets/            name -> JSON BucketInfo
 //	objects/<bucket>/   key  -> JSON ObjectMeta  (one nested bucket per S3 bucket)
+//	system/             "applied_index" -> uint64 (last Raft index applied)
 package boltstore
 
 import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -27,27 +42,94 @@ import (
 var (
 	bktBuckets = []byte("buckets")
 	bktObjects = []byte("objects")
+	bktSystem  = []byte("system")
+
+	keyAppliedIndex = []byte("applied_index")
 )
+
+// ErrStorage wraps failures of the underlying database (as opposed to
+// command results such as metadata.ErrNoSuchBucket). A Raft state machine
+// that sees it must stop rather than continue with diverged state.
+var ErrStorage = errors.New("boltstore: storage failure")
 
 // MaxListKeys is the largest page ListObjects returns (the S3 limit).
 const MaxListKeys = 1000
 
+// Op names a mutation.
+type Op string
+
+// Mutations understood by Apply.
+const (
+	OpCreateBucket Op = "CreateBucket"
+	OpDeleteBucket Op = "DeleteBucket"
+	OpPutObject    Op = "PutObject"
+	OpDeleteObject Op = "DeleteObject"
+)
+
+// Command is one deterministic mutation. It is the payload of a Raft log
+// entry, so it must carry everything Apply needs, including timestamps.
+type Command struct {
+	Op     Op                   `json:"op"`
+	Bucket string               `json:"bucket,omitempty"`
+	Key    string               `json:"key,omitempty"`
+	Time   time.Time            `json:"time,omitzero"`
+	Object *metadata.ObjectMeta `json:"object,omitempty"`
+}
+
+// Validate checks a command before it is proposed, so malformed commands
+// never reach the replicated log.
+func (c Command) Validate() error {
+	switch c.Op {
+	case OpCreateBucket:
+		if c.Bucket == "" || !utf8.ValidString(c.Bucket) {
+			return fmt.Errorf("%w: invalid bucket name", metadata.ErrInvalidArgument)
+		}
+	case OpDeleteBucket, OpDeleteObject:
+		if c.Bucket == "" {
+			return fmt.Errorf("%w: missing bucket", metadata.ErrInvalidArgument)
+		}
+	case OpPutObject:
+		if c.Object == nil {
+			return fmt.Errorf("%w: missing object", metadata.ErrInvalidArgument)
+		}
+		if c.Object.Key == "" || !utf8.ValidString(c.Object.Key) {
+			return fmt.Errorf("%w: key must be non-empty valid UTF-8", metadata.ErrInvalidArgument)
+		}
+	default:
+		return fmt.Errorf("%w: unknown op %q", metadata.ErrInvalidArgument, c.Op)
+	}
+	return nil
+}
+
 // Store is a BoltDB-backed metadata store.
 type Store struct {
-	db  *bolt.DB
-	now func() time.Time
+	path string
+	now  func() time.Time
+
+	// mu guards db. Normal operations hold it for reading; Restore holds it
+	// for writing while it swaps the database file.
+	mu sync.RWMutex
+	db *bolt.DB
 }
 
 var _ metadata.Metadata = (*Store)(nil)
 
 // Open opens (creating if needed) the database at path.
 func Open(path string) (*Store, error) {
+	db, err := openDB(path)
+	if err != nil {
+		return nil, err
+	}
+	return &Store{path: path, db: db, now: func() time.Time { return time.Now().UTC() }}, nil
+}
+
+func openDB(path string) (*bolt.DB, error) {
 	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 2 * time.Second})
 	if err != nil {
 		return nil, fmt.Errorf("boltstore: open %s: %w", path, err)
 	}
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range [][]byte{bktBuckets, bktObjects} {
+		for _, b := range [][]byte{bktBuckets, bktObjects, bktSystem} {
 			if _, err := tx.CreateBucketIfNotExists(b); err != nil {
 				return err
 			}
@@ -58,35 +140,214 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("boltstore: init: %w", err)
 	}
-	return &Store{db: db, now: func() time.Time { return time.Now().UTC() }}, nil
+	return db, nil
 }
 
 // Close closes the database.
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.db.Close()
+}
+
+func (s *Store) view(fn func(tx *bolt.Tx) error) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.db.View(fn)
+}
+
+// Apply executes cmd. When index is non-zero it is the Raft log index of
+// the command: commands at or below the stored applied index are skipped
+// (they were applied before a restart), and the new index is recorded in
+// the same transaction as the mutation, so state and index never diverge.
+//
+// The returned error is the command's result (for example
+// metadata.ErrBucketNotEmpty). A command that fails this way changes no
+// state but still advances the applied index.
+func (s *Store) Apply(index uint64, cmd Command) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var result error
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		if index > 0 {
+			sys := tx.Bucket(bktSystem)
+			if index <= appliedIndex(sys) {
+				return nil
+			}
+			var b [8]byte
+			binary.BigEndian.PutUint64(b[:], index)
+			if err := sys.Put(keyAppliedIndex, b[:]); err != nil {
+				return err
+			}
+		}
+		var err error
+		result, err = applyTx(tx, cmd)
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("%w: apply %s: %w", ErrStorage, cmd.Op, err)
+	}
+	return result
+}
+
+// applyTx performs one command inside tx. It returns (result, nil) for
+// outcomes that belong to the command, and a non-nil second error only for
+// storage failures, which abort the transaction. Commands check every
+// precondition before writing, so a non-nil result means nothing changed.
+func applyTx(tx *bolt.Tx, cmd Command) (result, fatal error) {
+	if err := cmd.Validate(); err != nil {
+		return err, nil
+	}
+	buckets := tx.Bucket(bktBuckets)
+	objects := tx.Bucket(bktObjects)
+	switch cmd.Op {
+	case OpCreateBucket:
+		if buckets.Get([]byte(cmd.Bucket)) != nil {
+			return metadata.ErrBucketAlreadyExists, nil
+		}
+		v, err := json.Marshal(metadata.BucketInfo{Name: cmd.Bucket, CreatedAt: cmd.Time})
+		if err != nil {
+			return nil, err
+		}
+		if err := buckets.Put([]byte(cmd.Bucket), v); err != nil {
+			return nil, err
+		}
+		_, err = objects.CreateBucket([]byte(cmd.Bucket))
+		return nil, err
+
+	case OpDeleteBucket:
+		if buckets.Get([]byte(cmd.Bucket)) == nil {
+			return metadata.ErrNoSuchBucket, nil
+		}
+		if b := objects.Bucket([]byte(cmd.Bucket)); b != nil {
+			if k, _ := b.Cursor().First(); k != nil {
+				return metadata.ErrBucketNotEmpty, nil
+			}
+			if err := objects.DeleteBucket([]byte(cmd.Bucket)); err != nil {
+				return nil, err
+			}
+		}
+		return nil, buckets.Delete([]byte(cmd.Bucket))
+
+	case OpPutObject:
+		b := objects.Bucket([]byte(cmd.Object.Bucket))
+		if b == nil {
+			return metadata.ErrNoSuchBucket, nil
+		}
+		v, err := json.Marshal(cmd.Object)
+		if err != nil {
+			return nil, err
+		}
+		return nil, b.Put([]byte(cmd.Object.Key), v)
+
+	case OpDeleteObject:
+		b := objects.Bucket([]byte(cmd.Bucket))
+		if b == nil {
+			return metadata.ErrNoSuchBucket, nil
+		}
+		if cmd.Key == "" {
+			return nil, nil
+		}
+		return nil, b.Delete([]byte(cmd.Key))
+	}
+	return fmt.Errorf("%w: unknown op %q", metadata.ErrInvalidArgument, cmd.Op), nil
+}
+
+func appliedIndex(sys *bolt.Bucket) uint64 {
+	v := sys.Get(keyAppliedIndex)
+	if len(v) != 8 {
+		return 0
+	}
+	return binary.BigEndian.Uint64(v)
+}
+
+// AppliedIndex returns the last Raft index recorded by Apply (0 if none).
+func (s *Store) AppliedIndex() (uint64, error) {
+	var idx uint64
+	err := s.view(func(tx *bolt.Tx) error {
+		idx = appliedIndex(tx.Bucket(bktSystem))
+		return nil
+	})
+	return idx, err
+}
+
+// Snapshot writes a consistent copy of the whole database to w. Writers are
+// not blocked while it runs (bolt read transactions are MVCC snapshots).
+func (s *Store) Snapshot(w io.Writer) error {
+	return s.view(func(tx *bolt.Tx) error {
+		_, err := tx.WriteTo(w)
+		return err
+	})
+}
+
+// Restore replaces the database with a snapshot produced by Snapshot. The
+// new file is written and fsynced beside the old one, then renamed over it,
+// so a crash leaves either the old or the new database, never a mix.
+func (s *Store) Restore(r io.Reader) error {
+	tmp := s.path + ".restore"
+	if err := writeFileSynced(tmp, r); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	// Check the snapshot opens before touching the live database.
+	check, err := openDB(tmp)
+	if err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("boltstore: restore: invalid snapshot: %w", err)
+	}
+	if err := check.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.db.Close(); err != nil {
+		return fmt.Errorf("boltstore: restore: close: %w", err)
+	}
+	if err := os.Rename(tmp, s.path); err != nil {
+		// Reopen the old database so the store stays usable.
+		db, oerr := openDB(s.path)
+		if oerr == nil {
+			s.db = db
+		}
+		return errors.Join(fmt.Errorf("boltstore: restore: rename: %w", err), oerr)
+	}
+	db, err := openDB(s.path)
+	if err != nil {
+		return fmt.Errorf("boltstore: restore: reopen: %w", err)
+	}
+	s.db = db
+	return nil
+}
+
+func writeFileSynced(path string, r io.Reader) error {
+	f, err := os.OpenFile(filepath.Clean(path), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("boltstore: restore: create: %w", err)
+	}
+	if _, err := io.Copy(f, r); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("boltstore: restore: write: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("boltstore: restore: fsync: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("boltstore: restore: close: %w", err)
+	}
+	return nil
+}
+
+// --- metadata.Metadata (single-node mode) ---
 
 // CreateBucket implements metadata.Metadata.
 func (s *Store) CreateBucket(ctx context.Context, name string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if name == "" || !utf8.ValidString(name) {
-		return fmt.Errorf("%w: invalid bucket name", metadata.ErrInvalidArgument)
-	}
-	return s.db.Update(func(tx *bolt.Tx) error {
-		buckets := tx.Bucket(bktBuckets)
-		if buckets.Get([]byte(name)) != nil {
-			return metadata.ErrBucketAlreadyExists
-		}
-		v, err := json.Marshal(metadata.BucketInfo{Name: name, CreatedAt: s.now()})
-		if err != nil {
-			return err
-		}
-		if err := buckets.Put([]byte(name), v); err != nil {
-			return err
-		}
-		_, err = tx.Bucket(bktObjects).CreateBucket([]byte(name))
-		return err
-	})
+	return s.Apply(0, Command{Op: OpCreateBucket, Bucket: name, Time: s.now()})
 }
 
 // DeleteBucket implements metadata.Metadata.
@@ -94,22 +355,29 @@ func (s *Store) DeleteBucket(ctx context.Context, name string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
-		buckets := tx.Bucket(bktBuckets)
-		if buckets.Get([]byte(name)) == nil {
-			return metadata.ErrNoSuchBucket
-		}
-		objs := tx.Bucket(bktObjects)
-		if b := objs.Bucket([]byte(name)); b != nil {
-			if k, _ := b.Cursor().First(); k != nil {
-				return metadata.ErrBucketNotEmpty
-			}
-			if err := objs.DeleteBucket([]byte(name)); err != nil {
-				return err
-			}
-		}
-		return buckets.Delete([]byte(name))
-	})
+	if name == "" {
+		return metadata.ErrNoSuchBucket
+	}
+	return s.Apply(0, Command{Op: OpDeleteBucket, Bucket: name})
+}
+
+// PutObject implements metadata.Metadata.
+func (s *Store) PutObject(ctx context.Context, obj metadata.ObjectMeta) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.Apply(0, Command{Op: OpPutObject, Object: &obj})
+}
+
+// DeleteObject implements metadata.Metadata. Deleting a missing key succeeds.
+func (s *Store) DeleteObject(ctx context.Context, bucket, key string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if bucket == "" {
+		return metadata.ErrNoSuchBucket
+	}
+	return s.Apply(0, Command{Op: OpDeleteObject, Bucket: bucket, Key: key})
 }
 
 // HeadBucket implements metadata.Metadata.
@@ -118,7 +386,7 @@ func (s *Store) HeadBucket(ctx context.Context, name string) (metadata.BucketInf
 	if err := ctx.Err(); err != nil {
 		return info, err
 	}
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		v := tx.Bucket(bktBuckets).Get([]byte(name))
 		if v == nil {
 			return metadata.ErrNoSuchBucket
@@ -134,7 +402,7 @@ func (s *Store) ListBuckets(ctx context.Context) ([]metadata.BucketInfo, error) 
 		return nil, err
 	}
 	var out []metadata.BucketInfo
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		return tx.Bucket(bktBuckets).ForEach(func(_, v []byte) error {
 			var info metadata.BucketInfo
 			if err := json.Unmarshal(v, &info); err != nil {
@@ -147,34 +415,13 @@ func (s *Store) ListBuckets(ctx context.Context) ([]metadata.BucketInfo, error) 
 	return out, err
 }
 
-// PutObject implements metadata.Metadata.
-func (s *Store) PutObject(ctx context.Context, obj metadata.ObjectMeta) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if obj.Key == "" || !utf8.ValidString(obj.Key) {
-		return fmt.Errorf("%w: key must be non-empty valid UTF-8", metadata.ErrInvalidArgument)
-	}
-	v, err := json.Marshal(obj)
-	if err != nil {
-		return err
-	}
-	return s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bktObjects).Bucket([]byte(obj.Bucket))
-		if b == nil {
-			return metadata.ErrNoSuchBucket
-		}
-		return b.Put([]byte(obj.Key), v)
-	})
-}
-
 // GetObject implements metadata.Metadata.
 func (s *Store) GetObject(ctx context.Context, bucket, key string) (metadata.ObjectMeta, error) {
 	var obj metadata.ObjectMeta
 	if err := ctx.Err(); err != nil {
 		return obj, err
 	}
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bktObjects).Bucket([]byte(bucket))
 		if b == nil {
 			return metadata.ErrNoSuchBucket
@@ -188,30 +435,13 @@ func (s *Store) GetObject(ctx context.Context, bucket, key string) (metadata.Obj
 	return obj, err
 }
 
-// DeleteObject implements metadata.Metadata. Deleting a missing key succeeds.
-func (s *Store) DeleteObject(ctx context.Context, bucket, key string) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	return s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(bktObjects).Bucket([]byte(bucket))
-		if b == nil {
-			return metadata.ErrNoSuchBucket
-		}
-		if key == "" {
-			return nil
-		}
-		return b.Delete([]byte(key))
-	})
-}
-
 // ListObjects implements metadata.Metadata (ListObjectsV2 semantics).
 func (s *Store) ListObjects(ctx context.Context, bucket string, opts metadata.ListOptions) (metadata.ListResult, error) {
 	var res metadata.ListResult
 	if err := ctx.Err(); err != nil {
 		return res, err
 	}
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bktObjects).Bucket([]byte(bucket))
 		if b == nil {
 			return metadata.ErrNoSuchBucket
@@ -377,7 +607,7 @@ func (s *Store) UpdateShardLocation(context.Context, metadata.ShardLocationUpdat
 // WalkChunks implements metadata.Metadata. It runs inside one read
 // transaction, so fn sees a consistent snapshot.
 func (s *Store) WalkChunks(ctx context.Context, fn func(bucket, key, versionID string, chunkIndex int, c metadata.Chunk) error) error {
-	return s.db.View(func(tx *bolt.Tx) error {
+	return s.view(func(tx *bolt.Tx) error {
 		return tx.Bucket(bktObjects).ForEachBucket(func(bucket []byte) error {
 			return tx.Bucket(bktObjects).Bucket(bucket).ForEach(func(k, v []byte) error {
 				if err := ctx.Err(); err != nil {

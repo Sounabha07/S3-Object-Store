@@ -25,18 +25,21 @@ x-storage: &storage
     timeout: 3s
     retries: 15
 
+# Static Raft membership, identical on every metadata node: id@raftaddr@httpurl.
+x-peers: &peers "meta-1@meta-1:7001@http://meta-1:7000,meta-2@meta-2:7001@http://meta-2:7000,meta-3@meta-3:7001@http://meta-3:7000"
+
 services:
   meta-1:
     <<: *meta
-    command: ["metadata", "-id", "meta-1", "-listen", ":7000", "-data", "/data"]
+    command: ["metadata", "-id", "meta-1", "-listen", ":7000", "-raft-bind", ":7001", "-data", "/data", "-peers", *peers]
     volumes: [meta-1:/data]
   meta-2:
     <<: *meta
-    command: ["metadata", "-id", "meta-2", "-listen", ":7000", "-data", "/data"]
+    command: ["metadata", "-id", "meta-2", "-listen", ":7000", "-raft-bind", ":7001", "-data", "/data", "-peers", *peers]
     volumes: [meta-2:/data]
   meta-3:
     <<: *meta
-    command: ["metadata", "-id", "meta-3", "-listen", ":7000", "-data", "/data"]
+    command: ["metadata", "-id", "meta-3", "-listen", ":7000", "-raft-bind", ":7001", "-data", "/data", "-peers", *peers]
     volumes: [meta-3:/data]
 
   storage-1:
@@ -66,8 +69,9 @@ services:
 
   gateway:
     <<: *node
-    # M1: single-node mode, metadata and shards on the gateway's own volume.
-    command: ["gateway", "-listen", ":9000", "-data", "/data"]
+    # M2: metadata in the Raft cluster; shards still on the gateway's volume
+    # until storage nodes take over in M3.
+    command: ["gateway", "-listen", ":9000", "-data", "/data", "-meta", "http://meta-1:7000,http://meta-2:7000,http://meta-3:7000"]
     ports: ["9000:9000"]
     volumes: [gateway:/data]
     healthcheck:
